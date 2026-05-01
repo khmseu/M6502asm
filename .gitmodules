@@ -1,0 +1,3 @@
+[submodule "BASIC-M6502"]
+	path = BASIC-M6502
+	url = https://github.com/microsoft/BASIC-M6502
