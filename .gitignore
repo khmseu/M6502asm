@@ -1,2 +1,4 @@
 *.pyc
-m6502_sim.bin
+*.bin
+*.lst
+test*
