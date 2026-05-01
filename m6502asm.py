@@ -401,6 +401,8 @@ class Emitter:
         self.segments = []   # list of (start_addr, bytearray)
         self._cur_addr = None
         self._cur_buf = None
+        # optional listing buffer populated during pass 2 when verbose
+        self.listing = []  # list of (addr, byte)
 
     def set_origin(self, addr: int):
         if self._cur_buf is not None and len(self._cur_buf) > 0:
@@ -413,6 +415,11 @@ class Emitter:
             self._cur_addr = 0
             self._cur_buf = bytearray()
         self._cur_buf.append(byte & 0xFF)
+        # record for listing
+        try:
+            self.listing.append((self._cur_addr + len(self._cur_buf) - 1, byte & 0xFF))
+        except Exception:
+            pass
 
     def flush(self):
         if self._cur_buf is not None and len(self._cur_buf) > 0:
@@ -618,6 +625,35 @@ class Assembler:
                     pass
             if uname == 'PRINTX' and self.pass_num == 1:
                 print(f"  [PRINTX] {raw.strip()}")
+            return
+
+        if uname in ('IFDEF', 'IFNDEF'):
+            # IFDEF sym,<body>  or  IFNDEF sym,<body>
+            raw = raw.strip()
+            # split at first comma not in angle
+            depth = 0
+            split_at = -1
+            for i, c in enumerate(raw):
+                if c == '<': depth += 1
+                elif c == '>': depth -= 1
+                elif c == ',' and depth == 0:
+                    split_at = i
+                    break
+            if split_at == -1:
+                return
+            sym_str = raw[:split_at].strip()
+            body_str = raw[split_at + 1:].strip()
+            # sym may be angle-bracketed or plain ident
+            if sym_str.startswith('<') and sym_str.endswith('>'):
+                sym_name = sym_str[1:-1].strip()
+            else:
+                sym_name = sym_str
+            sym_key = normalize_symbol(self._subst_params(sym_name.upper(), local_params))
+            defined = sym_key in self.symbols
+            take = (defined if uname == 'IFDEF' else not defined)
+            if take:
+                body = self._extract_body(body_str)
+                self._process_block(body, local_params)
             return
 
         if uname == 'XWD':
@@ -1367,6 +1403,28 @@ def write_output(emitter: Emitter, path: str, fmt: str):
               f"${lo:04X}–${hi - 1:04X})")
 
 
+def print_listing(emitter: Emitter, symbols: dict):
+    """Print a simple assembly listing: addresses, bytes, and labels."""
+    if not emitter.listing:
+        print("(no listing data)")
+        return
+    # build map addr -> bytes list
+    by_addr = {}
+    for addr, byte in emitter.listing:
+        by_addr.setdefault(addr, []).append(byte)
+    # invert symbols: addr -> [names]
+    sym_by_addr = {}
+    for name, val in symbols.items():
+        sym_by_addr.setdefault(val, []).append(name)
+    print("\nAssembly listing:\n")
+    # print in ascending address order
+    for addr in sorted(by_addr.keys()):
+        labels = sym_by_addr.get(addr, [])
+        lbl = ' '.join(labels) if labels else ''
+        bytes_hex = ' '.join(f"{b:02X}" for b in by_addr[addr])
+        print(f"{addr:04X}: {bytes_hex:20s} {lbl}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1411,6 +1469,9 @@ def main():
 
     print(f"Pass 2 complete. Symbols defined: {len(asm.symbols)}")
     if args.verbose:
+        # Print a simple listing (addresses, bytes, labels)
+        print_listing(emitter, asm.symbols)
+        print('\nSymbols:')
         for k, v in sorted(asm.symbols.items()):
             print(f"  {k:20s} = {v:#06x} ({v})")
 
