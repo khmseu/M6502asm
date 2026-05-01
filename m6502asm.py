@@ -462,6 +462,9 @@ class Assembler:
     def __init__(self, verbose: bool = False):
         self.verbose = verbose
         self.symbols: dict = {}
+        self.predefined: set = set()  # symbols set via -D
+        # mapping normalized_key -> set(original symbol names)
+        self.symbol_names: dict = {}
         self.macros: dict = {}      # name -> (params_list, body_str)
         self.pc: int = 0
         self.pass_num: int = 1
@@ -471,12 +474,17 @@ class Assembler:
         self._lineno: int = 0      # approximate source line number
         self._if_stack: list = []  # for nested IFE/IFN (not used, we recurse)
         self._origin_set: bool = False
+        # records of emitted bytes per source line (pass 2)
+        self.listing_records: list = []  # tuples (start_addr, [bytes], source_text)
 
     # ── public API ────────────────────────────────────────────────────────────
 
     def define(self, name: str, value: int):
         """Pre-define a symbol (from command line -D)."""
-        self.symbols[normalize_symbol(name)] = value
+        key = normalize_symbol(name)
+        self.symbols[key] = value
+        self.predefined.add(key)
+        self.symbol_names.setdefault(key, set()).add(name.upper())
 
     def assemble_file(self, path: str) -> Emitter:
         with open(path, 'r', errors='replace') as f:
@@ -540,7 +548,15 @@ class Assembler:
                 break
             pos = self._process_line(text, pos, local_params)
 
-    def _process_line(self, text: str, pos: int, local_params: dict) -> int:
+    def _extract_body(self, body_str: str) -> str:
+        """Extract the assembly body from a possibly angle-bracketed string."""
+        body_str = body_str.strip()
+        if not body_str:
+            return ''
+        if body_str.startswith('<'):
+            inner, _ = read_angle_block(body_str, 0)
+            return inner
+        return body_str
         """Process one logical statement. Returns new pos."""
         pos = skip_ws(text, pos)
         if pos >= len(text):
@@ -704,7 +720,8 @@ class Assembler:
 
         if uname == 'DC':
             # DC"string" — emit ASCII bytes, last byte with high bit set
-            s = self._parse_string_arg(raw)
+            raw2 = self._subst_params(raw, local_params)
+            s = self._parse_string_arg(raw2)
             for i, c in enumerate(s):
                 b = ord(c) & 0x7F
                 if i == len(s) - 1:
@@ -714,7 +731,8 @@ class Assembler:
 
         if uname == 'DT':
             # DT"string" — emit ASCII bytes (no high-bit marking)
-            s = self._parse_string_arg(raw)
+            raw2 = self._subst_params(raw, local_params)
+            s = self._parse_string_arg(raw2)
             for c in s:
                 self._emit(ord(c) & 0x7F)
             return
@@ -801,7 +819,9 @@ class Assembler:
         # Substitute local params in label name (for %Q etc.)
         name = self._subst_params(name, local_params)
         if self.pass_num == 1:
-            self.symbols[normalize_symbol(name)] = self.pc
+            key = normalize_symbol(name)
+            self.symbols[key] = self.pc
+            self.symbol_names.setdefault(key, set()).add(name.upper())
         # In pass 2 we don't redefine (use pass-1 values for forward refs)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -840,16 +860,20 @@ class Assembler:
     def _parse_string_arg(self, raw: str) -> str:
         """Extract string content from  "..."  or  < >  argument."""
         s = raw.strip()
+        if not s:
+            return ""
+        # unwrap angle brackets
         if s.startswith('<') and s.endswith('>'):
             s = s[1:-1]
-        if s.startswith('"') and s.endswith('"') and len(s) >= 2:
+        # unwrap surrounding parentheses which are used in macros like DC(A)
+        if s.startswith('(') and s.endswith(')'):
+            s = s[1:-1]
+        # unwrap quotes
+        if s.startswith('"') and s.endswith('"'):
             return s[1:-1]
         if s.startswith('"'):
             return s[1:]
         return s
-
-    def _extract_body(self, raw: str) -> str:
-        """From  ,<body>  or  <body>  return the body text."""
         s = raw.strip()
         if s.startswith(','):
             s = s[1:].lstrip()
@@ -959,6 +983,9 @@ class Assembler:
         for a in args:
             a = a.strip()
             if a.startswith('<') and a.endswith('>'):
+                a = a[1:-1]
+            # unwrap quoted args as MACRO-10 passes bare string
+            if a.startswith('"') and a.endswith('"'):
                 a = a[1:-1]
             result.append(a)
         return result
@@ -1344,7 +1371,14 @@ def _process_line_patched(self, text: str, pos: int,
         expr_str = self._subst_params(expr_str, local_params)
         val = self._eval(expr_str, local_params)
         sym = self._subst_params(ident.upper(), local_params)
-        self.symbols[normalize_symbol(sym)] = val
+        key = normalize_symbol(sym)
+        # Do not allow source assignments to overwrite symbols set via -D
+        if key in getattr(self, 'predefined', set()):
+            if self.verbose:
+                print(f"Skipping source assignment of pre-defined symbol {sym}")
+            return pos
+        self.symbols[key] = val
+        self.symbol_names.setdefault(key, set()).add(sym)
         return pos
 
     # ── Label definition:  IDENT:  or  IDENT:: ───────────────────────────────
@@ -1352,7 +1386,9 @@ def _process_line_patched(self, text: str, pos: int,
     if pos < len(text) and text[pos] == ':':
         label = self._subst_params(ident.upper(), local_params)
         if self.pass_num == 1:
-            self.symbols[normalize_symbol(label)] = self.pc
+            key = normalize_symbol(label)
+            self.symbols[key] = self.pc
+            self.symbol_names.setdefault(key, set()).add(label)
         pos += 1
         if pos < len(text) and text[pos] == ':':
             pos += 1  # global label (treated same as local for us)
@@ -1369,14 +1405,38 @@ def _process_line_patched(self, text: str, pos: int,
             return self._skip_to_eol(text, pos)
         pos = skip_ws(text, pos)
         raw_rest, pos = self._read_rest_of_line(text, pos)
-        self._dispatch(name, raw_rest.strip(), label, local_params)
+        # If pass 2, capture emitted bytes for this source line
+        if self.pass_num == 2:
+            before = len(self.emitter.listing)
+            start_addr = self.pc
+            self._dispatch(name, raw_rest.strip(), label, local_params)
+            after = len(self.emitter.listing)
+            if after > before:
+                new_entries = self.emitter.listing[before:after]
+                bytes_out = [b for _, b in new_entries]
+                src = (label + ': ' if label else '') + name + (' ' + raw_rest.strip() if raw_rest.strip() else '')
+                self.listing_records.append((start_addr, bytes_out, src))
+        else:
+            self._dispatch(name, raw_rest.strip(), label, local_params)
         return pos
 
     # ── No label: the first ident IS the mnemonic/directive ──────────────────
     name = ident.upper()
     # pos is already past optional whitespace after ident
     raw_rest, pos = self._read_rest_of_line(text, pos)
-    self._dispatch(name, raw_rest.strip(), None, local_params)
+    # capture listing for this source line in pass 2
+    if self.pass_num == 2:
+        before = len(self.emitter.listing)
+        start_addr = self.pc
+        self._dispatch(name, raw_rest.strip(), None, local_params)
+        after = len(self.emitter.listing)
+        if after > before:
+            new_entries = self.emitter.listing[before:after]
+            bytes_out = [b for _, b in new_entries]
+            src = name + (' ' + raw_rest.strip() if raw_rest.strip() else '')
+            self.listing_records.append((start_addr, bytes_out, src))
+    else:
+        self._dispatch(name, raw_rest.strip(), None, local_params)
     return pos
 
 
@@ -1403,21 +1463,35 @@ def write_output(emitter: Emitter, path: str, fmt: str):
               f"${lo:04X}–${hi - 1:04X})")
 
 
-def print_listing(emitter: Emitter, symbols: dict):
-    """Print a simple assembly listing: addresses, bytes, and labels."""
-    if not emitter.listing:
-        print("(no listing data)")
+def print_listing(emitter: Emitter, asm):
+    """Print a readable assembly listing using assembler's recorded records.
+
+    Expects `asm` to be the Assembler instance which holds `listing_records`
+    and `symbol_names` mapping for full symbol names.
+    """
+    print("\nAssembly listing:\n")
+    # build addr -> list of full symbol names
+    sym_by_addr = {}
+    try:
+        for key, val in asm.symbols.items():
+            names = asm.symbol_names.get(key, {key})
+            for n in names:
+                sym_by_addr.setdefault(val, []).append(n)
+    except Exception:
+        pass
+
+    if getattr(asm, 'listing_records', None):
+        for start_addr, bytes_out, src in asm.listing_records:
+            labels = sym_by_addr.get(start_addr, [])
+            lbl = (': '.join(labels) + ':') if labels else ''
+            bytes_hex = ' '.join(f"{b:02X}" for b in bytes_out)
+            print(f"{start_addr:04X}: {bytes_hex:20s} {lbl} {src}")
         return
-    # build map addr -> bytes list
+
+    # Fallback: per-address dump
     by_addr = {}
     for addr, byte in emitter.listing:
         by_addr.setdefault(addr, []).append(byte)
-    # invert symbols: addr -> [names]
-    sym_by_addr = {}
-    for name, val in symbols.items():
-        sym_by_addr.setdefault(val, []).append(name)
-    print("\nAssembly listing:\n")
-    # print in ascending address order
     for addr in sorted(by_addr.keys()):
         labels = sym_by_addr.get(addr, [])
         lbl = ' '.join(labels) if labels else ''
@@ -1470,7 +1544,7 @@ def main():
     print(f"Pass 2 complete. Symbols defined: {len(asm.symbols)}")
     if args.verbose:
         # Print a simple listing (addresses, bytes, labels)
-        print_listing(emitter, asm.symbols)
+        print_listing(emitter, asm)
         print('\nSymbols:')
         for k, v in sorted(asm.symbols.items()):
             print(f"  {k:20s} = {v:#06x} ({v})")
