@@ -56,14 +56,8 @@ def split_comment(line: str) -> tuple[str, str]:
 
 def angle_delta(line: str) -> int:
     code, _ = split_comment(line)
-    in_quote = False
     delta = 0
     for ch in code:
-        if ch == '"':
-            in_quote = not in_quote
-            continue
-        if in_quote:
-            continue
         if ch == "<":
             delta += 1
         elif ch == ">":
@@ -73,21 +67,15 @@ def angle_delta(line: str) -> int:
 
 def find_matching_angle_block(text: str, start_idx: int) -> int:
     depth = 1
-    in_quote = False
     idx = start_idx
     while idx < len(text):
         ch = text[idx]
-        if ch == '"':
-            in_quote = not in_quote
-            idx += 1
-            continue
-        if not in_quote:
-            if ch == "<":
-                depth += 1
-            elif ch == ">":
-                depth -= 1
-                if depth == 0:
-                    return idx
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth -= 1
+            if depth == 0:
+                return idx
         idx += 1
     return -1
 
@@ -105,9 +93,28 @@ class Translator:
         lines = source.splitlines()
         out: list[str] = []
         idx = 0
+        comment_block_delim: str | None = None
 
         while idx < len(lines):
             line = lines[idx]
+
+            if comment_block_delim is not None:
+                stripped = line.strip()
+                out.append(f"; {line}" if line else ";")
+                if stripped == comment_block_delim:
+                    comment_block_delim = None
+                idx += 1
+                continue
+
+            comment_open = re.match(r"^\s*COMMENT\s+(.+)\s*$", line, flags=re.IGNORECASE)
+            if comment_open:
+                delim = comment_open.group(1).strip()
+                if delim:
+                    comment_block_delim = delim
+                out.append(f"; {line}" if line else ";")
+                idx += 1
+                continue
+
             if re.match(r"^\s*DEFINE\b", line, flags=re.IGNORECASE):
                 block, consumed = self._consume_define_block(lines, idx)
                 out.extend(block)
@@ -183,6 +190,28 @@ class Translator:
             return f"({expr}) <> 0"
         return expr
 
+    def _split_trailing_endif_closers(self, stripped: str) -> tuple[str, int]:
+        if not stripped or stripped == ">":
+            return stripped, 0
+        trailing = len(stripped) - len(stripped.rstrip(">"))
+        if trailing == 0:
+            return stripped, 0
+        lt_count = stripped.count("<")
+        gt_count = stripped.count(">")
+        excess = gt_count - lt_count
+        if excess <= 0:
+            return stripped, 0
+        close_count = min(excess, trailing)
+        core = stripped[:-close_count].rstrip()
+        return core, close_count
+
+    def _looks_like_data_expr(self, text: str) -> bool:
+        if not text or re.search(r"\s", text):
+            return False
+        if text[0] not in "0123456789-\"^<(":
+            return False
+        return re.fullmatch(r"[0-9A-Za-z_.$%#@\^\"<>()+\-*/&!,]+", text) is not None
+
     def _translate_line(self, line: str) -> list[str]:
         code, comment = split_comment(line)
         raw = code.rstrip()
@@ -194,18 +223,23 @@ class Translator:
         if re.fullmatch(r">+", stripped):
             return [".endif" for _ in stripped]
 
+        stripped, trailing_endif_count = self._split_trailing_endif_closers(stripped)
+
         m_inline_if = re.match(r"^(IFE|IFN|IF)\s+(.+?),\s*<(.*)>\s*$", stripped, re.IGNORECASE)
         if m_inline_if:
             kind, expr, body = m_inline_if.groups()
             out = [f".if {self._if_expr(kind, expr)}"]
             out.extend(self._translate_line(body))
             out.append(".endif")
+            out.extend([".endif"] * trailing_endif_count)
             return out
 
         m_open_if = re.match(r"^(IFE|IFN|IF)\s+(.+?),\s*<\s*$", stripped, re.IGNORECASE)
         if m_open_if:
             kind, expr = m_open_if.groups()
-            return [f".if {self._if_expr(kind, expr)}"]
+            out = [f".if {self._if_expr(kind, expr)}"]
+            out.extend([".endif"] * trailing_endif_count)
+            return out
 
         label_match = re.match(r"^([A-Za-z_.$%#@][\w.$%#@]*)(::?)\s*(.*)$", stripped)
         if label_match:
@@ -225,48 +259,92 @@ class Translator:
         assign = re.match(r"^([A-Za-z_.$%#@][\w.$%#@]*)\s*(==|=)\s*(.+)$", stripped)
         if assign:
             sym, _eq, expr = assign.groups()
-            return [f"{self.map_symbol(sym)} .equ {expr.strip()}" + (f" {comment}" if comment else "")]
+            out = [f"{self.map_symbol(sym)} .equ {expr.strip()}" + (f" {comment}" if comment else "")]
+            out.extend([".endif"] * trailing_endif_count)
+            return out
 
         parts = stripped.split(None, 1)
         op = parts[0].upper()
         operand = parts[1].strip() if len(parts) > 1 else ""
 
         if op == "ORG":
-            return [f".org {operand}" + (f" {comment}" if comment else "")]
+            out = [f".org {operand}" + (f" {comment}" if comment else "")]
+            out.extend([".endif"] * trailing_endif_count)
+            return out
 
         if op == "SEARCH":
             if self.preserve_includes and operand:
                 include_name = operand.strip("<>").strip()
-                return [f'.include "{include_name}"' + (f" {comment}" if comment else "")]
+                out = [f'.include "{include_name}"' + (f" {comment}" if comment else "")]
+                out.extend([".endif"] * trailing_endif_count)
+                return out
             self.warnings.append(f"SEARCH directive left as comment: {stripped}")
-            return [f"; {stripped}" + (f" {comment}" if comment else "")]
+            out = [f"; {stripped}" + (f" {comment}" if comment else "")]
+            out.extend([".endif"] * trailing_endif_count)
+            return out
 
-        if op in {"TITLE", "SUBTTL", "SALL", "PAGE", "RADIX", "COMMENT", "END", "PRINTX", "IRPC", "IF1"}:
+        if op in {"TITLE", "SUBTTL", "SALL", "PAGE", "RADIX", "PRINTX", "IF1"}:
+            out = [f"; {stripped}" + (f" {comment}" if comment else "")]
+            out.extend([".endif"] * trailing_endif_count)
+            return out
+
+        if op == "END":
+            out = [f".end {operand}".rstrip() + (f" {comment}" if comment else "")]
+            out.extend([".endif"] * trailing_endif_count)
+            return out
+
+        if op == "EXP":
+            out = [f".byte {operand}" + (f" {comment}" if comment else "")]
+            out.extend([".endif"] * trailing_endif_count)
+            return out
+
+        if op in {"IRPC", "IFDIF"}:
             self.warnings.append(f"Directive requires manual review: {stripped}")
-            return [f"; {stripped}" + (f" {comment}" if comment else "")]
+            out = [f"; {stripped}" + (f" {comment}" if comment else "")]
+            out.extend([".endif"] * trailing_endif_count)
+            return out
 
         if op == "XWD":
-            return [f".word {operand}" + (f" {comment}" if comment else "")]
+            out = [f".word {operand}" + (f" {comment}" if comment else "")]
+            out.extend([".endif"] * trailing_endif_count)
+            return out
 
         m_dci = re.match(r"^DCI\s*\"(.*)\"$", stripped, re.IGNORECASE)
         if m_dci:
             chars = m_dci.group(1)
             if not chars:
-                return [".byte 0"]
+                out = [".byte 0"]
+                out.extend([".endif"] * trailing_endif_count)
+                return out
             encoded = [f"'{c}'" for c in chars[:-1]]
             encoded.append(f"'{chars[-1]}'|$80")
-            return [f".byte {', '.join(encoded)}" + (f" {comment}" if comment else "")]
+            out = [f".byte {', '.join(encoded)}" + (f" {comment}" if comment else "")]
+            out.extend([".endif"] * trailing_endif_count)
+            return out
 
         if op in IMM_MNEMONICS:
-            return [f"{IMM_MNEMONICS[op]} #{operand}" + (f" {comment}" if comment else "")]
+            out = [f"{IMM_MNEMONICS[op]} #{operand}" + (f" {comment}" if comment else "")]
+            out.extend([".endif"] * trailing_endif_count)
+            return out
 
         if op in INY_MNEMONICS:
-            return [f"{INY_MNEMONICS[op]} ({operand}),Y" + (f" {comment}" if comment else "")]
+            out = [f"{INY_MNEMONICS[op]} ({operand}),Y" + (f" {comment}" if comment else "")]
+            out.extend([".endif"] * trailing_endif_count)
+            return out
 
         if op == "JMPD":
-            return [f"JMP ({operand})" + (f" {comment}" if comment else "")]
+            out = [f"JMP ({operand})" + (f" {comment}" if comment else "")]
+            out.extend([".endif"] * trailing_endif_count)
+            return out
 
-        return [stripped + (f" {comment}" if comment else "")]
+        if self._looks_like_data_expr(stripped):
+            out = [f".byte {stripped}" + (f" {comment}" if comment else "")]
+            out.extend([".endif"] * trailing_endif_count)
+            return out
+
+        out = [stripped + (f" {comment}" if comment else "")]
+        out.extend([".endif"] * trailing_endif_count)
+        return out
 
 
 def load_symbol_map(path: str | None) -> dict[str, str]:

@@ -60,9 +60,11 @@ TL;DR: Create a Python-based translator that converts `m6502.asm` (MACRO-10/M650
 
 - Phase 2 completed: mapping/parser strategy documented in `plans/translate-m6502-to-xa65-phase-2-design.md`.
 - Phase 3 started: initial `m6502_to_xa65.py` implementation and unit tests added.
+- Phase 3 expanded: full-file translation pass on `BASIC-M6502/m6502.asm` now emits only one warning.
+- Implemented: COMMENT block passthrough, DEFINE quote-pattern fix, trailing `>` conditional closer handling, `EXP` -> `.byte`, and `END` -> `.end` mapping.
 
 ## Next Steps
 
-- Phase 3: broaden directive and conditional coverage against `BASIC-M6502/m6502.asm` full-file translation output.
-- Phase 4: improve complex macro handling and add symbol-collision mapping defaults.
+- Phase 4: convert remaining `IRPC`/`IFDIF` metaprogramming in `DT` macro to xa65-native macro logic.
+- Phase 4: add symbol-collision mapping defaults and conflict-reporting in `--map-file` workflows.
 - Add example converted outputs under `examples/converted/`.
