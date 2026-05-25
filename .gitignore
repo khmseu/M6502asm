@@ -3,3 +3,10 @@
 *.lst
 test*
 tools/rewrite_unpushed_commit_messages.py
+
+!tests/
+!tests/**
+!examples/
+!examples/**
+tests/__pycache__/
+tests/**/*.pyc

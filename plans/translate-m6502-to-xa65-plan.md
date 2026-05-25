@@ -1,8 +1,9 @@
-## Plan: Translate M6502 asm to xa65
+# Plan: Translate M6502 asm to xa65
 
 TL;DR: Create a Python-based translator that converts `m6502.asm` (MACRO-10/M6502 style) into xa65 v2.4.0-compatible source. The translator will aim for a full translation scope, preserve includes and file structure where possible, and produce warnings for constructs requiring manual review. Output will be suitable for assembling with xa65 v2.4.0. A git commit will be produced when changes are ready.
 
-**Phases 5**
+## Phases (5)
+
 1. **Phase 1: Analyze syntax differences**
     - **Objective:** Identify syntactic and semantic differences between `m6502.asm` and xa65.
     - **Files/Functions to Modify/Create:** Read `BASIC-M6502/m6502.asm`, `test_dci.asm`, and `m6502asm.py` for parsing rules.
@@ -47,13 +48,21 @@ TL;DR: Create a Python-based translator that converts `m6502.asm` (MACRO-10/M650
         1. Document usage, limitations, and known manual-review areas.
         2. Provide example conversions and sample `xa65` assemble commands.
 
-**Open Questions (answered)**
+## Open Questions (answered)
+
 1. Scope: Full translation (yes).
 2. Output: Preserve includes and file structure where feasible (yes).
 3. Target xa65: v2.4.0; assume feature flags when useful.
 4. Language: Python accepted.
 5. Auto-commit: Yes, produce git commit when ready.
 
-**Next Steps**
-- Phase 2: design mapping & parser strategy and create translator skeleton.
-- Then invoke implementation subagent to produce `m6502_to_xa65.py` + tests.
+## Progress Update
+
+- Phase 2 completed: mapping/parser strategy documented in `plans/translate-m6502-to-xa65-phase-2-design.md`.
+- Phase 3 started: initial `m6502_to_xa65.py` implementation and unit tests added.
+
+## Next Steps
+
+- Phase 3: broaden directive and conditional coverage against `BASIC-M6502/m6502.asm` full-file translation output.
+- Phase 4: improve complex macro handling and add symbol-collision mapping defaults.
+- Add example converted outputs under `examples/converted/`.
