@@ -10,5 +10,4 @@ tools/rewrite_unpushed_commit_messages.py
 !examples/**
 tests/__pycache__/
 tests/**/*.pyc
-examples/converted/m6502_xa65.asm
-examples/converted/m6502_xa65.warnings.txt
+examples/converted/
