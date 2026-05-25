@@ -95,6 +95,10 @@ def find_matching_angle_block(text: str, start_idx: int) -> int:
     return -1
 
 
+class _Unresolved(Exception):
+    """Raised by `_try_eval_int` when an unknown identifier is encountered."""
+
+
 class Translator:
     def __init__(self, symbol_map: dict[str, str] | None = None, preserve_includes: bool = False):
         self.symbol_map = symbol_map or {}
@@ -102,22 +106,167 @@ class Translator:
         self.warnings: list[str] = []
         self._mapped_symbol_owner: dict[str, str] = {}
         self._emitted_collision_keys: set[tuple[str, str, str]] = set()
-        self._macros: dict[str, tuple[list[str], list[str]]] = {}  # name -> (params, body_lines)  # name -> param count for function-like #defines
+        self._macros: dict[str, tuple[list[str], list[str]]] = {}  # name -> (params, body_lines)
+        # Current source radix for bare numeric literals (set by `RADIX N`).
+        self._radix: int = 10
+        # Python-side state for MACRO-10 assembler variables (e.g. `Q=Q+2`).
+        # Lets stateful counters such as the `DCE`/`DCI` error-code mechanism
+        # be evaluated during translation instead of relying on xa65's
+        # `#define` (which cannot represent recursive redefinitions).
+        self._vars: dict[str, int] = {}
+        # Labels discovered during the pre-pass; used to suppress `=`
+        # aliases that would shadow a later `LABEL:` definition.
+        self._labels: set[str] = set()
+        # Textual `#define X Y` aliases collected during the pre-pass so they
+        # can be emitted at the top of the output to satisfy forward refs.
+        self._aliases: dict[str, str] = {}
 
     def _sanitize_symbol(self, symbol: str) -> str:
-        mapped = re.sub(r"[^A-Za-z0-9_]", "_", symbol)
+        # MACRO-10 symbols are case-insensitive but xa65 is case-sensitive.
+        # Canonicalize to upper case so mixed-case references (e.g. `ife
+        # addprc,<...>` against `ADDPRC==1`) resolve to the same symbol.
+        mapped = re.sub(r"[^A-Za-z0-9_]", "_", symbol).upper()
         if not mapped:
             return "_"
         if not re.match(r"^[A-Za-z_]", mapped):
             mapped = f"_{mapped}"
+        # MACRO-10 truncates symbols to 6 significant characters; references
+        # such as `RESTORE` and `RESTOR` denote the same symbol.
+        if len(mapped) > 6:
+            mapped = mapped[:6]
         return mapped
 
     def _normalize_expr(self, expr: str) -> str:
-        out = _RADIX_OCT_RE.sub(lambda m: str(int(m.group(1), 8)), expr)
-        out = _RADIX_HEX_RE.sub(lambda m: str(int(m.group(1), 16)), out)
-        out = _RADIX_DEC_RE.sub(lambda m: m.group(1), out)
-        out = _SYMBOL_TOKEN_RE.sub(lambda m: self.map_symbol(m.group(0)), out); out = out.replace("<", "").replace(">", "")
+        # MACRO-10 uses `!` as bitwise OR; xa65/C use `|`.
+        out_expr = expr.replace("!", "|")
+        # Convert explicit-radix prefixes first, marking their digits with a
+        # NUL sentinel so the RADIX-state pass below does not re-interpret
+        # them. The sentinel is stripped at the end.
+        out = _RADIX_OCT_RE.sub(lambda m: f"\x00{int(m.group(1), 8)}", out_expr)
+        out = _RADIX_HEX_RE.sub(lambda m: f"\x00{int(m.group(1), 16)}", out)
+        out = _RADIX_DEC_RE.sub(lambda m: f"\x00{m.group(1)}", out)
+        if self._radix == 8:
+            out = re.sub(
+                r"(?<![\w$\x00.])([0-7]+)(?!\w)",
+                lambda m: str(int(m.group(1), 8)),
+                out,
+            )
+        out = out.replace("\x00", "")
+        # Translate MACRO-10 `.` (current PC) to xa65 `*`. Match a bare dot not
+        # adjacent to identifier characters.
+        out = re.sub(r"(?<![\w.])\.(?![\w.])", "*", out)
+        out = _SYMBOL_TOKEN_RE.sub(lambda m: self.map_symbol(m.group(0)), out)
+        out = out.replace("<", "").replace(">", "")
+        out = self._force_left_assoc(out)
         return out
+
+    @staticmethod
+    def _force_left_assoc(expr: str) -> str:
+        """Reparenthesize a flat operator expression to be left-associative.
+
+        MACRO-10 evaluates left-to-right with no operator precedence, while
+        xa65/C apply standard precedence. We only rewrite when the expression
+        is entirely flat (no existing parens) and contains 2+ binary operators,
+        which is when ambiguity actually matters (e.g. `BUF-1/256`).
+        """
+        s = expr.strip()
+        if not s or "(" in s or ")" in s or "," in s:
+            return expr
+        op_chars = set("+-*/&|")
+        tokens: list[str] = []
+        i = 0
+        while i < len(s):
+            c = s[i]
+            if c.isspace():
+                i += 1
+                continue
+            if c in op_chars and tokens and tokens[-1] not in op_chars:
+                tokens.append(c)
+                i += 1
+                continue
+            j = i
+            while j < len(s):
+                ch = s[j]
+                if ch.isspace():
+                    break
+                if ch in op_chars and j > i and s[j - 1] not in op_chars:
+                    break
+                j += 1
+            tokens.append(s[i:j])
+            i = j
+        if len(tokens) < 5 or len(tokens) % 2 == 0:
+            return expr
+        # Skip when all operators share the same C precedence — standard
+        # left-to-right grouping already matches MACRO-10 semantics. This also
+        # avoids gratuitous leading parens that xa65 would mis-parse as
+        # indirect addressing (e.g. `STY (BUF-1)+1`).
+        def prec(op: str) -> int:
+            if op in "*/%":
+                return 1
+            if op in "+-":
+                return 2
+            return 3
+        precs = {prec(tokens[k]) for k in range(1, len(tokens), 2)}
+        if len(precs) == 1:
+            return expr
+        acc = tokens[0]
+        k = 1
+        while k < len(tokens):
+            # Skip wrapping the outermost result: leading `(...)` makes xa65
+            # interpret operands like `STY (addr)+1` as indirect addressing.
+            if k + 2 < len(tokens):
+                acc = f"({acc}{tokens[k]}{tokens[k + 1]})"
+            else:
+                acc = f"{acc}{tokens[k]}{tokens[k + 1]}"
+            k += 2
+        return acc
+
+    def _try_eval_int(self, expr: str) -> int | None:
+        """Attempt to evaluate `expr` to an int using current var/radix state.
+
+        Returns None if the expression references unknown symbols or contains
+        unsupported syntax.
+        """
+        e = expr.strip()
+        if not e:
+            return None
+        # Strip MACRO-10 angle brackets used for grouping.
+        e = e.replace("<", "(").replace(">", ")")
+        # Convert explicit-radix prefixes, marking digits so the radix pass
+        # below does not re-interpret them.
+        e = re.sub(r"\^O([0-7]+)", lambda m: f"\x00{int(m.group(1), 8)}", e)
+        e = re.sub(r"\^X([0-9A-Fa-f]+)", lambda m: f"\x00{int(m.group(1), 16)}", e)
+        e = re.sub(r"\^D(\d+)", lambda m: f"\x00{m.group(1)}", e)
+        if self._radix == 8:
+            e = re.sub(
+                r"(?<![\w$\x00.])([0-7]+)(?!\w)",
+                lambda m: str(int(m.group(1), 8)),
+                e,
+            )
+        e = e.replace("\x00", "")
+        # MACRO-10 `&` is bitwise AND; Python uses `&` already. `!` is OR in
+        # some MACRO-10 dialects but BASIC-M6502 uses `|` consistently, so no
+        # mapping needed here.
+        # Substitute known identifiers; bail on unknowns.
+        def sub_id(m: re.Match[str]) -> str:
+            tok = m.group(0)
+            if tok in self._vars:
+                return str(self._vars[tok])
+            mapped = self.symbol_map.get(tok)
+            if mapped and mapped in self._vars:
+                return str(self._vars[mapped])
+            raise _Unresolved(tok)
+        try:
+            e = re.sub(r"[A-Za-z_.][\w.]*", sub_id, e)
+        except _Unresolved:
+            return None
+        # Now expression should be pure arithmetic over ints.
+        if not re.match(r"^[\d\s+\-*/%()&|^]+$", e):
+            return None
+        try:
+            return int(eval(e, {"__builtins__": {}}, {}))
+        except Exception:
+            return None
 
     def map_symbol(self, symbol: str) -> str:
         mapped = self.symbol_map.get(symbol, symbol)
@@ -137,10 +286,49 @@ class Translator:
         return mapped
 
     def translate(self, source: str) -> TranslationResult:
+        # Pre-pass: discover numeric constants and textual aliases so forward
+        # references resolve in the real emit pass.
+        forward_vars: dict[str, int] = {}
+        forward_aliases: dict[str, str] = {}
+        if not getattr(self, "_in_prepass", False):
+            self._in_prepass = True
+            try:
+                self._translate_pass(source)
+                forward_vars = dict(self._vars)
+                forward_aliases = dict(self._aliases)
+            finally:
+                self._in_prepass = False
+            # Reset mutating state for the real emit pass; seed with discovered
+            # values so forward `==` constants substitute correctly.
+            self.warnings = []
+            self._mapped_symbol_owner = {}
+            self._emitted_collision_keys = set()
+            self._macros = {}
+            self._radix = 10
+            self._vars = dict(forward_vars)
+            self._aliases = {}
+        return self._translate_pass(
+            source, forward_vars=forward_vars, forward_aliases=forward_aliases
+        )
+
+    def _translate_pass(
+        self,
+        source: str,
+        forward_vars: dict[str, int] | None = None,
+        forward_aliases: dict[str, str] | None = None,
+    ) -> TranslationResult:
         lines = source.splitlines()
         out: list[str] = []
         idx = 0
         comment_block_delim: str | None = None
+        if forward_vars:
+            for name, value in forward_vars.items():
+                if name.isidentifier():
+                    out.append(f"#define {name} {value}")
+        if forward_aliases:
+            for name, body in forward_aliases.items():
+                if name.isidentifier() and name not in (forward_vars or {}):
+                    out.append(f"#define {name} {body}")
 
         while idx < len(lines):
             line = lines[idx]
@@ -285,9 +473,30 @@ class Translator:
         params_raw = (header_match.group(2) or "").strip()
         params = [self.map_symbol(p.strip()) for p in params_raw.split(",") if p.strip()]
 
+        # MACRO-10 lets a DEFINE shadow a built-in opcode under a guard like
+        # `IFE RORSW,<DEFINE ROR (WD),<...>>`, with the opposite branch using
+        # the real opcode. We can't track that conditional, so we never let a
+        # DEFINE shadow an actual 6502 opcode and rely on xa65's native one.
+        if name in _OPCODES:
+            return [f"; DEFINE {name} (shadowed; using opcode)"], consumed
+
         self._macros[name] = (params, body.splitlines())
         return [f"; DEFINE {name}"], consumed
 
+
+    def _if_directive(self, kind: str, expr: str) -> str:
+        """Return the xa65 conditional directive line for a MACRO-10 IF*."""
+        norm = self._normalize_expr(expr.strip())
+        ku = kind.upper()
+        if ku == "IFE":
+            return f"#if {norm} == 0"
+        if ku == "IFN":
+            return f"#if {norm} != 0"
+        if ku == "IFDEF":
+            return f"#ifdef {norm}"
+        if ku == "IFNDEF":
+            return f"#ifndef {norm}"
+        return f"#if {norm}"
 
     def _if_expr(self, kind: str, expr: str) -> str:
         expr = self._normalize_expr(expr.strip())
@@ -332,7 +541,7 @@ class Translator:
         trailing = ("<" + joined)[pos + 1 :].strip()
         extra_endif = len(trailing) if trailing and re.fullmatch(r">+", trailing) else 0
 
-        out = [f"#if {self._if_expr(kind, expr)}"]
+        out = [self._if_directive(kind, expr)]
         body_lines = body.splitlines()
         j = 0
         while j < len(body_lines):
@@ -470,10 +679,23 @@ class Translator:
 
         stripped, trailing_endif_count = self._split_trailing_endif_closers(stripped)
 
+        m_inline_repeat = re.match(r"^REPEAT\s+([^,]+),\s*<(.*)>\s*$", stripped, re.IGNORECASE)
+        if m_inline_repeat:
+            count_str, body = m_inline_repeat.groups()
+            count = self._try_eval_int(count_str.strip())
+            if count is not None:
+                out: list[str] = []
+                if comment:
+                    out.append(comment)
+                for _ in range(count):
+                    out.extend(self._translate_line(body))
+                out.extend(["#endif"] * trailing_endif_count)
+                return out
+
         m_inline_if = re.match(r"^(IFE|IFN|IF|IFDEF|IFNDEF)\s+(.+?),\s*<(.*)>\s*$", stripped, re.IGNORECASE)
         if m_inline_if:
             kind, expr, body = m_inline_if.groups()
-            out = [f"#if {self._if_expr(kind, expr)}"]
+            out = [self._if_directive(kind, expr)]
             out.extend(self._translate_line(body))
             out.append("#endif")
             out.extend(["#endif"] * trailing_endif_count)
@@ -482,14 +704,15 @@ class Translator:
         m_open_if = re.match(r"^(IFE|IFN|IF|IFDEF|IFNDEF)\s+(.+?),\s*<\s*$", stripped, re.IGNORECASE)
         if m_open_if:
             kind, expr = m_open_if.groups()
-            out = [f"#if {self._if_expr(kind, expr)}"]
+            out = [self._if_directive(kind, expr)]
             out.extend(["#endif"] * trailing_endif_count)
             return out
 
-        label_match = re.match(r"^([A-Za-z_.$%#@][\w.$%#@]*)(::?)\s*(.*)$", stripped)
+        label_match = re.match(r"^([A-Za-z_.$%#@][\w.$%#@]*)(::?)!?\s*(.*)$", stripped)
         if label_match:
             label, _dbl, rest = label_match.groups()
             mapped = self.map_symbol(label)
+            self._labels.add(mapped)
             if rest:
                 rest_out = self._translate_line(rest)
                 if not rest_out:
@@ -519,14 +742,47 @@ class Translator:
 
         assign = re.match(r"^([A-Za-z_.$%#@][\w.$%#@]*)\s*(==|=)\s*(.+)$", stripped)
         if assign:
-            sym, _eq, expr = assign.groups()
-            out = [f"#define {self.map_symbol(sym)} {self._normalize_expr(expr.strip())}" + (f" {comment}" if comment else "")]
+            sym, eq, expr = assign.groups()
+            mapped_sym = self.map_symbol(sym)
+            value = self._try_eval_int(expr.strip())
+            if value is not None:
+                self._vars[sym] = value
+                self._vars[mapped_sym] = value
+                # Emit `#define` for both `=` and `==` so xa65 sees the
+                # numeric value. The `=` form is technically redefinable in
+                # MACRO-10, but xa65 tolerates `#define` redefinition and we
+                # already track the live value in `self._vars` for use by
+                # subsequent `==Q` snapshots.
+                out = []
+                if comment:
+                    out.append(comment)
+                out.append(f"#define {mapped_sym} {value}")
+                out.extend(["#endif"] * trailing_endif_count)
+                return out
+            # Fallback: emit textual #define. Comment goes on its own line so
+            # it does not leak into the macro body.
+            out = []
+            if comment:
+                out.append(comment)
+            alias_body = self._normalize_expr(expr.strip())
+            self._aliases[mapped_sym] = alias_body
+            out.append(f"#define {mapped_sym} {alias_body}")
             out.extend(["#endif"] * trailing_endif_count)
             return out
 
         parts = stripped.split(None, 1)
         op = parts[0].upper()
         operand = parts[1].strip() if len(parts) > 1 else ""
+        # MACRO-10 allows macro calls without whitespace before the argument,
+        # e.g. `DCE"NF"` or `DCI(A)`. Split on first non-identifier char and
+        # check if the prefix is a known macro.
+        m_nospace = re.match(r"^([A-Za-z_][\w.]*)([^\w.].*)$", parts[0])
+        if m_nospace:
+            candidate = m_nospace.group(1).upper()
+            if candidate in self._macros:
+                op = candidate
+                tail = m_nospace.group(2)
+                operand = (tail + (" " + operand if operand else "")).strip()
 
         if op == "ORG":
             out = [f"* = {self._normalize_expr(operand)}" + (f" {comment}" if comment else "")]
@@ -544,7 +800,18 @@ class Translator:
             out.extend(["#endif"] * trailing_endif_count)
             return out
 
-        if op in {"TITLE", "SUBTTL", "SALL", "PAGE", "RADIX", "IF1"} or op.startswith("PRINTX"):
+        if op == "RADIX":
+            try:
+                self._radix = int(operand.strip(), 10)
+            except ValueError:
+                self.warnings.append(f"Could not parse RADIX operand: {operand!r}")
+            out = [f"; {stripped}" + (f" {comment}" if comment else "")]
+            out.extend(["#endif"] * trailing_endif_count)
+            return out
+
+        if op in {"TITLE", "SUBTTL", "SALL", "PAGE", "IF1", "LIST", "NLIST", "XLIST", "NOLIST"} or op.startswith("PRINTX") or op.startswith("."):
+            # `.XCREF`, `.CREF`, `.LIST`, `.NLIST`, etc. are listing-only
+            # pseudo-ops with no machine-code effect; preserve as comments.
             out = [f"; {stripped}" + (f" {comment}" if comment else "")]
             out.extend(["#endif"] * trailing_endif_count)
             return out
@@ -609,6 +876,25 @@ class Translator:
             out.extend(["#endif"] * trailing_endif_count)
             return out
 
+        # `DC "STRING"` (or `DC("STRING")`): emit ASCII bytes with the last
+        # byte's high bit set (BASIC-M6502 end-of-string marker).
+        m_dc = re.match(r'^DC\s*\(?\s*"([^"]*)"\s*\)?$', stripped, re.IGNORECASE)
+        if m_dc:
+            s = m_dc.group(1)
+            if s:
+                def char_lit(c: str) -> str:
+                    return f"'{c}'" if c != "'" else "39"
+                if len(s) == 1:
+                    body = f"{char_lit(s)}|$80"
+                else:
+                    prefix = ", ".join(char_lit(c) for c in s[:-1])
+                    body = f"{prefix}, {char_lit(s[-1])}|$80"
+                out = [f".byt {body}" + (f" {comment}" if comment else "")]
+            else:
+                out = [f"; DC (empty)" + (f" {comment}" if comment else "")]
+            out.extend(["#endif"] * trailing_endif_count)
+            return out
+
         m_adr = re.match(r"^ADR\s*\((.+)\)$", stripped, re.IGNORECASE)
         if m_adr:
             out = [f".word {self._normalize_expr(m_adr.group(1).strip())}" + (f" {comment}" if comment else "")]
@@ -642,7 +928,14 @@ class Translator:
             return expanded_out
 
         if len(parts) > 1:
-            out = [f"{parts[0]} {self._normalize_expr(parts[1].strip())}" + (f" {comment}" if comment else "")]
+            operand_norm = self._normalize_expr(parts[1].strip())
+            # xa65 expresses accumulator addressing as the bare opcode (e.g.
+            # `ASL` rather than `ASL A`). Strip a literal `A` (or `A,`) operand
+            # for the shift/rotate/inc/dec family.
+            if op in {"ASL", "LSR", "ROL", "ROR", "INC", "DEC"} and operand_norm.rstrip(",").strip().upper() == "A":
+                out = [parts[0] + (f" {comment}" if comment else "")]
+            else:
+                out = [f"{parts[0]} {operand_norm}" + (f" {comment}" if comment else "")]
         else:
             out = [stripped + (f" {comment}" if comment else "")]
         out.extend(["#endif"] * trailing_endif_count)
