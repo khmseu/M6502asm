@@ -1,7 +1,11 @@
+import contextlib
+import io
 import re
+import tempfile
 import unittest
+from pathlib import Path
 
-from m6502_to_xa65 import Translator
+from m6502_to_xa65 import Translator, main
 
 
 class TranslateTests(unittest.TestCase):
@@ -82,6 +86,22 @@ class TranslateTests(unittest.TestCase):
         out = Translator().translate(src).text
         self.assertIn(".byte 0", out)
         self.assertIn(".endif", out)
+
+    def test_cli_strict_returns_nonzero_on_warnings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "warn.asm"
+            src.write_text('IRPC Q,<IFDIF <Q><\">,<EXP \"Q\">>>\n', encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = main(["--in", str(src), "--dry-run", "--strict"])
+            self.assertEqual(1, rc)
+
+    def test_cli_strict_returns_zero_without_warnings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "ok.asm"
+            src.write_text('DCI"END"\n', encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = main(["--in", str(src), "--dry-run", "--strict"])
+            self.assertEqual(0, rc)
 
 
 if __name__ == "__main__":

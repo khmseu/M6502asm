@@ -370,6 +370,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Write translated source to stdout.")
     parser.add_argument("--map-file", help="JSON map of old symbol names to new symbol names.")
     parser.add_argument("--preserve-includes", action="store_true", help="Convert SEARCH to .include.")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero exit code if translation emits any warnings.",
+    )
     return parser.parse_args(argv)
 
 
@@ -395,6 +400,10 @@ def main(argv: list[str] | None = None) -> int:
 
     for warning in result.warnings:
         print(f"warning: {warning}", file=sys.stderr)
+
+    if args.strict and result.warnings:
+        print("error: strict mode failed due to translation warnings", file=sys.stderr)
+        return 1
 
     return 0
 
