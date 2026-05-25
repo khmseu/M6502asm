@@ -102,7 +102,7 @@ class Translator:
         self.warnings: list[str] = []
         self._mapped_symbol_owner: dict[str, str] = {}
         self._emitted_collision_keys: set[tuple[str, str, str]] = set()
-        self._func_macros: dict[str, int] = {}  # name -> param count for function-like #defines
+        self._macros: dict[str, tuple[list[str], list[str]]] = {}  # name -> (params, body_lines)  # name -> param count for function-like #defines
 
     def _sanitize_symbol(self, symbol: str) -> str:
         mapped = re.sub(r"[^A-Za-z0-9_]", "_", symbol)
@@ -116,7 +116,7 @@ class Translator:
         out = _RADIX_OCT_RE.sub(lambda m: str(int(m.group(1), 8)), expr)
         out = _RADIX_HEX_RE.sub(lambda m: str(int(m.group(1), 16)), out)
         out = _RADIX_DEC_RE.sub(lambda m: m.group(1), out)
-        out = _SYMBOL_TOKEN_RE.sub(lambda m: self.map_symbol(m.group(0)), out)
+        out = _SYMBOL_TOKEN_RE.sub(lambda m: self.map_symbol(m.group(0)), out); out = out.replace("<", "").replace(">", "")
         return out
 
     def map_symbol(self, symbol: str) -> str:
@@ -169,7 +169,7 @@ class Translator:
                     idx += consumed
                     continue
 
-            if re.match(r"^\s*(IFE|IFN|IF)\b", line, flags=re.IGNORECASE):
+            if re.match(r"^\s*(IFE|IFN|IF|IFDEF|IFNDEF)\b", line, flags=re.IGNORECASE):
                 block, consumed = self._consume_if_block(lines, idx)
                 if consumed > 0:
                     out.extend(block)
@@ -183,96 +183,110 @@ class Translator:
                     idx += consumed
                     continue
 
-            m_repeat = re.match(r"^\s*REPEAT\s+([A-Za-z0-9_.$%#@]+)\s*,?\s*<(.*)>.*$", line, re.IGNORECASE)
+            # Handle REPEAT
+            m_repeat = re.match(r"^\s*REPEAT\s+([^,]+),?\s*(.*)$", line, re.IGNORECASE)
             if m_repeat:
-                n_times_str, body = m_repeat.groups()
-                try:
-                    if n_times_str.startswith('0x'): val = int(n_times_str[2:], 16)
-                    elif n_times_str.startswith('$'): val = int(n_times_str[1:], 16)
-                    else: val = int(n_times_str)
-                    for _ in range(val):
-                        out.extend(self._translate_line(body))
-                except ValueError:
-                    out.append(f"; REPEAT {n_times_str} ignored (symbolic count)")
-                idx += 1
-                continue
+                n_times_str, rest = m_repeat.groups()
+                body_lines = []
+                consumed = 0
+                if '<' in rest:
+                    collected, consumed = self._consume_raw_bracketed_block(lines, idx)
+                    joined = "\n".join(collected)
+                    first_lt = joined.find("<")
+                    last_gt = joined.rfind(">")
+                    if first_lt != -1 and last_gt != -1:
+                        inner = joined[first_lt+1:last_gt]
+                        body_lines = inner.splitlines()
+                elif rest.strip():
+                    body_lines = [rest.strip()]
+                    consumed = 1
+                
+                if body_lines:
+                    try:
+                        val_str = n_times_str.strip()
+                        # Very crude evaluation for things like 3+ADDPRC
+                        if '+' in val_str:
+                            parts_plus = val_str.split('+')
+                            val = 0
+                            for p in parts_plus:
+                                p = p.strip()
+                                if p.isdigit(): val += int(p)
+                                elif p.startswith('^O'): val += int(p[2:], 8)
+                                elif p.startswith('$'): val += int(p[1:], 16)
+                                else: 
+                                    raise ValueError("Complex expression")
+                        elif val_str.startswith('^O'): val = int(val_str[2:], 8)
+                        elif val_str.startswith('$'): val = int(val_str[1:], 16)
+                        else: val = int(val_str)
+                        
+                        for _ in range(val):
+                            for bline in body_lines:
+                                out.extend(self._translate_line(bline))
+                    except (ValueError, TypeError):
+                        out.append(f"; REPEAT {n_times_str} ignored")
+                    
+                    idx += consumed
+                    continue
 
             out.extend(self._translate_line(line))
             idx += 1
 
         return TranslationResult(text="\n".join(out) + "\n", warnings=self.warnings)
 
-    def _consume_define_block(self, lines: list[str], start: int) -> tuple[list[str], int]:
+    def _consume_raw_bracketed_block(self, lines: list[str], start: int) -> tuple[list[str], int]:
         collected: list[str] = []
         idx = start
         balance = 0
         started = False
-
         while idx < len(lines):
             ln = lines[idx]
             collected.append(ln)
             delta = angle_delta(ln)
-            if "<" in split_comment(ln)[0]:
+            code, _ = split_comment(ln)
+            if "<" in code:
                 started = True
             balance += delta
             idx += 1
             if started and balance <= 0:
                 break
+        return collected, idx - start
 
+    def _consume_define_block(self, lines: list[str], start: int) -> tuple[list[str], int]:
+        collected, consumed = self._consume_raw_bracketed_block(lines, start)
         joined = "\n".join(collected)
         m = re.search(r"DEFINE\s+", joined, flags=re.IGNORECASE)
         if not m:
             self.warnings.append("Unparsed DEFINE block; preserved as comments.")
-            return ([f"; {line}" for line in collected], idx - start)
+            return ([f"; {line}" for line in collected], consumed)
 
         header_start = m.start()
         first_lt = joined.find("<", header_start)
         if first_lt == -1:
             self.warnings.append("DEFINE without body; preserved as comments.")
-            return ([f"; {line}" for line in collected], idx - start)
+            return ([f"; {line}" for line in collected], consumed)
 
         header = joined[header_start:first_lt].strip()
-        body_end = find_matching_angle_block(joined, first_lt + 1)
-        if body_end == -1:
+        body_end = joined.rfind(">")
+        if body_end == -1 or body_end <= first_lt:
             self.warnings.append("Unbalanced DEFINE body; preserved as comments.")
-            return ([f"; {line}" for line in collected], idx - start)
+            return ([f"; {line}" for line in collected], consumed)
 
         body = joined[first_lt + 1 : body_end]
         header_match = re.match(
-            r"^DEFINE\s+([A-Za-z_.$%#@][\w.$%#@]*)\s*(?:\(([^)]*)\))?\s*,\s*$",
+            r"^DEFINE\s+([A-Za-z_.$%#@][\w.$%#@]*)\s*(?:\(([^)]*)\))?",
             header,
             flags=re.IGNORECASE,
         )
         if not header_match:
             self.warnings.append(f"Could not parse DEFINE header: {header}")
-            return ([f"; {line}" for line in collected], idx - start)
+            return ([f"; {line}" for line in collected], consumed)
 
-        name = self.map_symbol(header_match.group(1).strip())
+        name = self.map_symbol(header_match.group(1).strip()).upper()
         params_raw = (header_match.group(2) or "").strip()
         params = [self.map_symbol(p.strip()) for p in params_raw.split(",") if p.strip()]
 
-        if name.upper() == "DT" and len(params) == 1:
-            # DT is representable as a simple function-like preprocessor macro.
-            self._func_macros[name] = 1
-            return [f"#define {name}({params[0]}) .byt {params[0]}"], idx - start
-
-
-        body_statements: list[str] = []
-        for body_line in body.splitlines():
-            translated = self._translate_line(body_line)
-            for stmt in translated:
-                stmt_code, _stmt_comment = split_comment(stmt)
-                cleaned = stmt_code.strip()
-                if cleaned:
-                    body_statements.append(cleaned)
-
-        wrapped = f".(:{':'.join(body_statements)}:.)" if body_statements else ".(:.)"
-        if params:
-            out = [f"#define {name}({', '.join(params)}) {wrapped}"]
-            self._func_macros[name] = len(params)
-        else:
-            out = [f"#define {name} {wrapped}"]
-        return out, idx - start
+        self._macros[name] = (params, body.splitlines())
+        return [f"; DEFINE {name}"], consumed
 
 
     def _if_expr(self, kind: str, expr: str) -> str:
@@ -281,12 +295,16 @@ class Translator:
             return f"{expr} == 0"
         if kind.upper() == "IFN":
             return f"{expr} != 0"
+        if kind.upper() == "IFDEF":
+            return f"defined({expr})"
+        if kind.upper() == "IFNDEF":
+            return f"!defined({expr})"
         return expr
 
     def _consume_if_block(self, lines: list[str], start: int) -> tuple[list[str], int]:
         code0, _comment0 = split_comment(lines[start])
         first = code0.strip()
-        m = re.match(r"^(IFE|IFN|IF)\s+(.+?),\s*<(.*)$", first, re.IGNORECASE)
+        m = re.match(r"^(IFE|IFN|IF|IFDEF|IFNDEF)\s+(.+?),\s*<(.*)$", first, re.IGNORECASE)
         if not m:
             return [], 0
 
@@ -325,7 +343,7 @@ class Translator:
                     out.extend(nested)
                     j += consumed
                     continue
-            if re.match(r"^\s*(IFE|IFN|IF)\b", line_j, flags=re.IGNORECASE):
+            if re.match(r"^\s*(IFE|IFN|IF|IFDEF|IFNDEF)\b", line_j, flags=re.IGNORECASE):
                 nested, consumed = self._consume_if_block(body_lines, j)
                 if consumed > 0:
                     out.extend(nested)
@@ -383,7 +401,7 @@ class Translator:
                     out.extend(nested)
                     j += consumed
                     continue
-            if re.match(r"^\s*(IFE|IFN|IF)\b", line_j, flags=re.IGNORECASE):
+            if re.match(r"^\s*(IFE|IFN|IF|IFDEF|IFNDEF)\b", line_j, flags=re.IGNORECASE):
                 nested, consumed = self._consume_if_block(body_lines, j)
                 if consumed > 0:
                     out.extend(nested)
@@ -408,6 +426,10 @@ class Translator:
             return f"{expr} == 0"
         if kind.upper() == "IFN":
             return f"{expr} != 0"
+        if kind.upper() == "IFDEF":
+            return f"defined({expr})"
+        if kind.upper() == "IFNDEF":
+            return f"!defined({expr})"
         return expr
 
     def _split_trailing_endif_closers(self, stripped: str) -> tuple[str, int]:
@@ -448,7 +470,7 @@ class Translator:
 
         stripped, trailing_endif_count = self._split_trailing_endif_closers(stripped)
 
-        m_inline_if = re.match(r"^(IFE|IFN|IF)\s+(.+?),\s*<(.*)>\s*$", stripped, re.IGNORECASE)
+        m_inline_if = re.match(r"^(IFE|IFN|IF|IFDEF|IFNDEF)\s+(.+?),\s*<(.*)>\s*$", stripped, re.IGNORECASE)
         if m_inline_if:
             kind, expr, body = m_inline_if.groups()
             out = [f"#if {self._if_expr(kind, expr)}"]
@@ -457,7 +479,7 @@ class Translator:
             out.extend(["#endif"] * trailing_endif_count)
             return out
 
-        m_open_if = re.match(r"^(IFE|IFN|IF)\s+(.+?),\s*<\s*$", stripped, re.IGNORECASE)
+        m_open_if = re.match(r"^(IFE|IFN|IF|IFDEF|IFNDEF)\s+(.+?),\s*<\s*$", stripped, re.IGNORECASE)
         if m_open_if:
             kind, expr = m_open_if.groups()
             out = [f"#if {self._if_expr(kind, expr)}"]
@@ -480,7 +502,7 @@ class Translator:
                       first.strip().upper() not in _OPCODES and 
                       first.strip().upper() not in IMM_MNEMONICS and 
                       first.strip().upper() not in INY_MNEMONICS and
-                      first.strip().upper() not in self._func_macros):
+                      first.strip().upper() not in self._macros):
                     # Bare symbol after label colon is a data byte, e.g. LINWID: LINLEN
                     rest_out[0] = f"{mapped}: .byt {first}".rstrip()
                     if comment:
@@ -598,11 +620,26 @@ class Translator:
             out.extend(["#endif"] * trailing_endif_count)
             return out
 
-        if op in self._func_macros:
-            # Function-like macro call: STWD STREND -> STWD(STREND)
-            out = [f"{parts[0]}({self._normalize_expr(operand)})" + (f" {comment}" if comment else "")]
-            out.extend(["#endif"] * trailing_endif_count)
-            return out
+        if op in self._macros:
+            params, body_lines = self._macros[op]
+            # Split operand by comma for multi-param macros
+            args = [a.strip() for a in operand.split(',')] if operand else []
+            # Expansion
+            expanded_out = []
+            for bline in body_lines:
+                # Replace params in bline
+                for i, pname in enumerate(params):
+                    val = args[i] if i < len(args) else ""
+                    # Match parameter as whole word
+                    bline = re.sub(r'\b' + re.escape(pname) + r'\b', val, bline)
+                expanded_out.extend(self._translate_line(bline))
+            
+            if comment:
+                if expanded_out: expanded_out[0] += f" {comment}"
+                else: expanded_out = [comment]
+            
+            expanded_out.extend(["#endif"] * trailing_endif_count)
+            return expanded_out
 
         if len(parts) > 1:
             out = [f"{parts[0]} {self._normalize_expr(parts[1].strip())}" + (f" {comment}" if comment else "")]

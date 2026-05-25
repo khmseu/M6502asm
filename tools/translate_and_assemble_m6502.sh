@@ -30,6 +30,7 @@ set +e
   -l "$SYMBOL_FILE" \
   -e "$ERROR_LOG" \
   "$TRANSLATED_ASM" \
+  -XMASM \
   >/dev/null 2>&1
 XA_STATUS=$?
 
