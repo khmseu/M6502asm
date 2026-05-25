@@ -36,6 +36,11 @@ INY_MNEMONICS = {
     "EORDY": "EOR",
 }
 
+_RADIX_OCT_RE = re.compile(r"\^O([0-7]+)", re.IGNORECASE)
+_RADIX_HEX_RE = re.compile(r"\^X([0-9A-F]+)", re.IGNORECASE)
+_RADIX_DEC_RE = re.compile(r"\^D([0-9]+)", re.IGNORECASE)
+_SYMBOL_TOKEN_RE = re.compile(r"\b[A-Za-z_.$%#@][\w.$%#@]*\b")
+
 
 @dataclass
 class TranslationResult:
@@ -88,8 +93,24 @@ class Translator:
         self._mapped_symbol_owner: dict[str, str] = {}
         self._emitted_collision_keys: set[tuple[str, str, str]] = set()
 
+    def _sanitize_symbol(self, symbol: str) -> str:
+        mapped = re.sub(r"[^A-Za-z0-9_]", "_", symbol)
+        if not mapped:
+            return "_"
+        if not re.match(r"^[A-Za-z_]", mapped):
+            mapped = f"_{mapped}"
+        return mapped
+
+    def _normalize_expr(self, expr: str) -> str:
+        out = _RADIX_OCT_RE.sub(lambda m: str(int(m.group(1), 8)), expr)
+        out = _RADIX_HEX_RE.sub(lambda m: str(int(m.group(1), 16)), out)
+        out = _RADIX_DEC_RE.sub(lambda m: m.group(1), out)
+        out = _SYMBOL_TOKEN_RE.sub(lambda m: self.map_symbol(m.group(0)), out)
+        return out
+
     def map_symbol(self, symbol: str) -> str:
         mapped = self.symbol_map.get(symbol, symbol)
+        mapped = self._sanitize_symbol(mapped)
         owner = self._mapped_symbol_owner.get(mapped)
         if owner is None:
             self._mapped_symbol_owner[mapped] = symbol
@@ -135,6 +156,20 @@ class Translator:
                 out.extend(block)
                 idx += consumed
                 continue
+
+            if re.match(r"^\s*(IFE|IFN|IF)\b", line, flags=re.IGNORECASE):
+                block, consumed = self._consume_if_block(lines, idx)
+                if consumed > 0:
+                    out.extend(block)
+                    idx += consumed
+                    continue
+
+            if re.match(r"^\s*IF[12]\s*,\s*<", line, flags=re.IGNORECASE):
+                block, consumed = self._consume_pass_if_block(lines, idx)
+                if consumed > 0:
+                    out.extend(block)
+                    idx += consumed
+                    continue
 
             out.extend(self._translate_line(line))
             idx += 1
@@ -191,23 +226,144 @@ class Translator:
         params = [self.map_symbol(p.strip()) for p in params_raw.split(",") if p.strip()]
 
         if name.upper() == "DT" and len(params) == 1:
-            # DT expands text arguments into bytes; in xa65 a direct .byte on the
-            # macro parameter preserves the intended call-site behavior.
-            return [f".macro {name} {params[0]}", f".byte {params[0]}", ".endmacro"], idx - start
+            # DT is representable as a simple function-like preprocessor macro.
+            return [f"#define {name}({params[0]}) .byt {params[0]}"], idx - start
 
-        out = [f".macro {name}{(' ' + ', '.join(params)) if params else ''}"]
+        body_statements: list[str] = []
         for body_line in body.splitlines():
             translated = self._translate_line(body_line)
-            out.extend(translated if translated else [""])
-        out.append(".endmacro")
+            for stmt in translated:
+                stmt_code, _stmt_comment = split_comment(stmt)
+                cleaned = stmt_code.strip()
+                if cleaned:
+                    body_statements.append(cleaned)
+
+        wrapped = f".(:{':'.join(body_statements)}:.)" if body_statements else ".(:.)"
+        if params:
+            out = [f"#define {name}({', '.join(params)}) {wrapped}"]
+        else:
+            out = [f"#define {name} {wrapped}"]
+        return out, idx - start
+
+    def _consume_pass_if_block(self, lines: list[str], start: int) -> tuple[list[str], int]:
+        code0, _ = split_comment(lines[start])
+        m = re.match(r"^\s*IF([12])\s*,\s*<(.*)$", code0.strip(), re.IGNORECASE)
+        if not m:
+            return [], 0
+
+        pass_num = m.group(1)
+        after_lt = m.group(2)
+        collected = [after_lt]
+        idx = start + 1
+        balance = 1 + after_lt.count("<") - after_lt.count(">")
+
+        while idx < len(lines) and balance > 0:
+            code_i, _ = split_comment(lines[idx])
+            piece = code_i.rstrip()
+            collected.append(piece)
+            balance += piece.count("<") - piece.count(">")
+            idx += 1
+
+        joined = "\n".join(collected)
+        pos = find_matching_angle_block("<" + joined, 1)
+        if pos == -1:
+            return [], 0
+
+        body = ("<" + joined)[1:pos]
+        trailing = ("<" + joined)[pos + 1 :].strip()
+        extra_endif = len(trailing) if trailing and re.fullmatch(r">+", trailing) else 0
+
+        cond = "1" if pass_num == "1" else "0"
+        out = [f"#if {cond}"]
+        body_lines = body.splitlines()
+        j = 0
+        while j < len(body_lines):
+            line_j = body_lines[j]
+            if re.match(r"^\s*DEFINE\b", line_j, flags=re.IGNORECASE):
+                nested, consumed = self._consume_define_block(body_lines, j)
+                if consumed > 0:
+                    out.extend(nested)
+                    j += consumed
+                    continue
+            if re.match(r"^\s*(IFE|IFN|IF)\b", line_j, flags=re.IGNORECASE):
+                nested, consumed = self._consume_if_block(body_lines, j)
+                if consumed > 0:
+                    out.extend(nested)
+                    j += consumed
+                    continue
+            out.extend(self._translate_line(line_j))
+            j += 1
+
+        out.append("#endif")
+        out.extend(["#endif"] * extra_endif)
+        return out, idx - start
+
+    def _consume_if_block(self, lines: list[str], start: int) -> tuple[list[str], int]:
+        code0, _comment0 = split_comment(lines[start])
+        first = code0.strip()
+        m = re.match(r"^(IFE|IFN|IF)\s+(.+?),\s*<(.*)$", first, re.IGNORECASE)
+        if not m:
+            return [], 0
+
+        kind = m.group(1)
+        expr = m.group(2)
+        after_lt = m.group(3)
+
+        collected = [after_lt]
+        idx = start + 1
+        balance = 1 + after_lt.count("<") - after_lt.count(">")
+
+        while idx < len(lines) and balance > 0:
+            code_i, _ = split_comment(lines[idx])
+            piece = code_i.rstrip()
+            collected.append(piece)
+            balance += piece.count("<") - piece.count(">")
+            idx += 1
+
+        joined = "\n".join(collected)
+        pos = find_matching_angle_block("<" + joined, 1)
+        if pos == -1:
+            return [], 0
+
+        body = ("<" + joined)[1:pos]
+        trailing = ("<" + joined)[pos + 1 :].strip()
+        extra_endif = len(trailing) if trailing and re.fullmatch(r">+", trailing) else 0
+
+        out = [f"#if {self._if_expr(kind, expr)}"]
+        body_lines = body.splitlines()
+        j = 0
+        while j < len(body_lines):
+            line_j = body_lines[j]
+            if re.match(r"^\s*DEFINE\b", line_j, flags=re.IGNORECASE):
+                nested, consumed = self._consume_define_block(body_lines, j)
+                if consumed > 0:
+                    out.extend(nested)
+                    j += consumed
+                    continue
+            if re.match(r"^\s*(IFE|IFN|IF)\b", line_j, flags=re.IGNORECASE):
+                nested, consumed = self._consume_if_block(body_lines, j)
+                if consumed > 0:
+                    out.extend(nested)
+                    j += consumed
+                    continue
+            if re.match(r"^\s*IF[12]\s*,\s*<", line_j, flags=re.IGNORECASE):
+                nested, consumed = self._consume_pass_if_block(body_lines, j)
+                if consumed > 0:
+                    out.extend(nested)
+                    j += consumed
+                    continue
+            out.extend(self._translate_line(line_j))
+            j += 1
+        out.append("#endif")
+        out.extend(["#endif"] * extra_endif)
         return out, idx - start
 
     def _if_expr(self, kind: str, expr: str) -> str:
-        expr = expr.strip()
+        expr = self._normalize_expr(expr.strip())
         if kind.upper() == "IFE":
-            return f"({expr}) = 0"
+            return f"{expr} == 0"
         if kind.upper() == "IFN":
-            return f"({expr}) <> 0"
+            return f"{expr} != 0"
         return expr
 
     def _split_trailing_endif_closers(self, stripped: str) -> tuple[str, int]:
@@ -232,6 +388,9 @@ class Translator:
             return False
         return re.fullmatch(r"[0-9A-Za-z_.$%#@\^\"<>()+\-*/&!,]+", text) is not None
 
+    def _looks_like_alias_expr(self, text: str) -> bool:
+        return re.fullmatch(r"[0-9A-Za-z_.$%#@\^<>()+\-*/&!]+", text) is not None
+
     def _translate_line(self, line: str) -> list[str]:
         code, comment = split_comment(line)
         raw = code.rstrip()
@@ -241,24 +400,24 @@ class Translator:
             return [comment if comment else ""]
 
         if re.fullmatch(r">+", stripped):
-            return [".endif" for _ in stripped]
+            return ["#endif" for _ in stripped]
 
         stripped, trailing_endif_count = self._split_trailing_endif_closers(stripped)
 
         m_inline_if = re.match(r"^(IFE|IFN|IF)\s+(.+?),\s*<(.*)>\s*$", stripped, re.IGNORECASE)
         if m_inline_if:
             kind, expr, body = m_inline_if.groups()
-            out = [f".if {self._if_expr(kind, expr)}"]
+            out = [f"#if {self._if_expr(kind, expr)}"]
             out.extend(self._translate_line(body))
-            out.append(".endif")
-            out.extend([".endif"] * trailing_endif_count)
+            out.append("#endif")
+            out.extend(["#endif"] * trailing_endif_count)
             return out
 
         m_open_if = re.match(r"^(IFE|IFN|IF)\s+(.+?),\s*<\s*$", stripped, re.IGNORECASE)
         if m_open_if:
             kind, expr = m_open_if.groups()
-            out = [f".if {self._if_expr(kind, expr)}"]
-            out.extend([".endif"] * trailing_endif_count)
+            out = [f"#if {self._if_expr(kind, expr)}"]
+            out.extend(["#endif"] * trailing_endif_count)
             return out
 
         label_match = re.match(r"^([A-Za-z_.$%#@][\w.$%#@]*)(::?)\s*(.*)$", stripped)
@@ -266,6 +425,10 @@ class Translator:
             label, _dbl, rest = label_match.groups()
             mapped = self.map_symbol(label)
             if rest:
+                if self._looks_like_alias_expr(rest):
+                    out = [f"#define {mapped} {self._normalize_expr(rest)}" + (f" {comment}" if comment else "")]
+                    out.extend(["#endif"] * trailing_endif_count)
+                    return out
                 rest_out = self._translate_line(rest)
                 if not rest_out:
                     return [f"{mapped}:" + (f" {comment}" if comment else "")]
@@ -279,8 +442,8 @@ class Translator:
         assign = re.match(r"^([A-Za-z_.$%#@][\w.$%#@]*)\s*(==|=)\s*(.+)$", stripped)
         if assign:
             sym, _eq, expr = assign.groups()
-            out = [f"{self.map_symbol(sym)} .equ {expr.strip()}" + (f" {comment}" if comment else "")]
-            out.extend([".endif"] * trailing_endif_count)
+            out = [f"#define {self.map_symbol(sym)} {self._normalize_expr(expr.strip())}" + (f" {comment}" if comment else "")]
+            out.extend(["#endif"] * trailing_endif_count)
             return out
 
         parts = stripped.split(None, 1)
@@ -288,45 +451,50 @@ class Translator:
         operand = parts[1].strip() if len(parts) > 1 else ""
 
         if op == "ORG":
-            out = [f".org {operand}" + (f" {comment}" if comment else "")]
-            out.extend([".endif"] * trailing_endif_count)
+            out = [f"* = {self._normalize_expr(operand)}" + (f" {comment}" if comment else "")]
+            out.extend(["#endif"] * trailing_endif_count)
             return out
 
         if op == "SEARCH":
             if self.preserve_includes and operand:
                 include_name = operand.strip("<>").strip()
                 out = [f'.include "{include_name}"' + (f" {comment}" if comment else "")]
-                out.extend([".endif"] * trailing_endif_count)
+                out.extend(["#endif"] * trailing_endif_count)
                 return out
             self.warnings.append(f"SEARCH directive left as comment: {stripped}")
             out = [f"; {stripped}" + (f" {comment}" if comment else "")]
-            out.extend([".endif"] * trailing_endif_count)
+            out.extend(["#endif"] * trailing_endif_count)
             return out
 
         if op in {"TITLE", "SUBTTL", "SALL", "PAGE", "RADIX", "PRINTX", "IF1"}:
             out = [f"; {stripped}" + (f" {comment}" if comment else "")]
-            out.extend([".endif"] * trailing_endif_count)
+            out.extend(["#endif"] * trailing_endif_count)
             return out
 
         if op == "END":
-            out = [f".end {operand}".rstrip() + (f" {comment}" if comment else "")]
-            out.extend([".endif"] * trailing_endif_count)
+            out = [f"; END {operand}".rstrip() + (f" {comment}" if comment else "")]
+            out.extend(["#endif"] * trailing_endif_count)
             return out
 
         if op == "EXP":
-            out = [f".byte {operand}" + (f" {comment}" if comment else "")]
-            out.extend([".endif"] * trailing_endif_count)
+            out = [f".byt {self._normalize_expr(operand)}" + (f" {comment}" if comment else "")]
+            out.extend(["#endif"] * trailing_endif_count)
             return out
 
         if op in {"IRPC", "IFDIF"}:
             self.warnings.append(f"Directive requires manual review: {stripped}")
             out = [f"; {stripped}" + (f" {comment}" if comment else "")]
-            out.extend([".endif"] * trailing_endif_count)
+            out.extend(["#endif"] * trailing_endif_count)
             return out
 
         if op == "XWD":
-            out = [f".word {operand}" + (f" {comment}" if comment else "")]
-            out.extend([".endif"] * trailing_endif_count)
+            out = [f".word {self._normalize_expr(operand)}" + (f" {comment}" if comment else "")]
+            out.extend(["#endif"] * trailing_endif_count)
+            return out
+
+        if op == "BLOCK":
+            out = [f".dsb {self._normalize_expr(operand)}" + (f" {comment}" if comment else "")]
+            out.extend(["#endif"] * trailing_endif_count)
             return out
 
         m_dci = re.match(r"^DCI\s*\"(.*)\"$", stripped, re.IGNORECASE)
@@ -334,36 +502,45 @@ class Translator:
             chars = m_dci.group(1)
             if not chars:
                 out = [".byte 0"]
-                out.extend([".endif"] * trailing_endif_count)
+                out.extend(["#endif"] * trailing_endif_count)
                 return out
             encoded = [f"'{c}'" for c in chars[:-1]]
             encoded.append(f"'{chars[-1]}'|$80")
-            out = [f".byte {', '.join(encoded)}" + (f" {comment}" if comment else "")]
-            out.extend([".endif"] * trailing_endif_count)
+            out = [f".byt {', '.join(encoded)}" + (f" {comment}" if comment else "")]
+            out.extend(["#endif"] * trailing_endif_count)
             return out
 
         if op in IMM_MNEMONICS:
-            out = [f"{IMM_MNEMONICS[op]} #{operand}" + (f" {comment}" if comment else "")]
-            out.extend([".endif"] * trailing_endif_count)
+            out = [f"{IMM_MNEMONICS[op]} #{self._normalize_expr(operand)}" + (f" {comment}" if comment else "")]
+            out.extend(["#endif"] * trailing_endif_count)
             return out
 
         if op in INY_MNEMONICS:
-            out = [f"{INY_MNEMONICS[op]} ({operand}),Y" + (f" {comment}" if comment else "")]
-            out.extend([".endif"] * trailing_endif_count)
+            out = [f"{INY_MNEMONICS[op]} ({self._normalize_expr(operand)}),Y" + (f" {comment}" if comment else "")]
+            out.extend(["#endif"] * trailing_endif_count)
             return out
 
         if op == "JMPD":
-            out = [f"JMP ({operand})" + (f" {comment}" if comment else "")]
-            out.extend([".endif"] * trailing_endif_count)
+            out = [f"JMP ({self._normalize_expr(operand)})" + (f" {comment}" if comment else "")]
+            out.extend(["#endif"] * trailing_endif_count)
+            return out
+
+        m_adr = re.match(r"^ADR\((.+)\)$", stripped, re.IGNORECASE)
+        if m_adr:
+            out = [f".word {self._normalize_expr(m_adr.group(1).strip())}" + (f" {comment}" if comment else "")]
+            out.extend(["#endif"] * trailing_endif_count)
             return out
 
         if self._looks_like_data_expr(stripped):
-            out = [f".byte {stripped}" + (f" {comment}" if comment else "")]
-            out.extend([".endif"] * trailing_endif_count)
+            out = [f".byt {self._normalize_expr(stripped)}" + (f" {comment}" if comment else "")]
+            out.extend(["#endif"] * trailing_endif_count)
             return out
 
-        out = [stripped + (f" {comment}" if comment else "")]
-        out.extend([".endif"] * trailing_endif_count)
+        if len(parts) > 1:
+            out = [f"{parts[0]} {self._normalize_expr(parts[1].strip())}" + (f" {comment}" if comment else "")]
+        else:
+            out = [stripped + (f" {comment}" if comment else "")]
+        out.extend(["#endif"] * trailing_endif_count)
         return out
 
 

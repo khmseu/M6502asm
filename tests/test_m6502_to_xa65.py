@@ -19,9 +19,9 @@ class TranslateTests(unittest.TestCase):
     def test_directive_conversion(self):
         src = "ORG ^O20000\nFOO==1\nBAR=2\n"
         out = Translator().translate(src).text
-        self.assertIn(".org ^O20000", out)
-        self.assertIn("FOO .equ 1", out)
-        self.assertIn("BAR .equ 2", out)
+        self.assertIn("* = 8192", out)
+        self.assertIn("#define FOO 1", out)
+        self.assertIn("#define BAR 2", out)
 
     def test_label_and_comment_preservation(self):
         src = "START:: LDAI 0 ; init\n"
@@ -31,10 +31,9 @@ class TranslateTests(unittest.TestCase):
     def test_macro_conversion(self):
         src = "DEFINE CLR(WD),<\n\tLDAI\t0\n\tSTA\tWD>\n"
         out = Translator().translate(src).text
-        self.assertIn(".macro CLR WD", out)
+        self.assertIn("#define CLR(WD)", out)
         self.assertIn("LDA #0", out)
-        self.assertRegex(out, r"STA\s+WD")
-        self.assertIn(".endmacro", out)
+        self.assertIn("STA WD", out)
 
     def test_include_handling(self):
         src = "SEARCH M6502\n"
@@ -44,7 +43,7 @@ class TranslateTests(unittest.TestCase):
     def test_dci_conversion(self):
         src = 'DCI"END"\n'
         out = Translator().translate(src).text
-        self.assertIn(".byte 'E', 'N', 'D'|$80", out)
+        self.assertIn(".byt 'E', 'N', 'D'|$80", out)
 
     def test_define_with_irpc_quote_pattern(self):
         src = (
@@ -56,9 +55,8 @@ class TranslateTests(unittest.TestCase):
         )
         result = Translator().translate(src)
         self.assertEqual([], result.warnings)
-        self.assertIn(".macro DT Q", result.text)
-        self.assertIn(".byte Q", result.text)
-        self.assertIn(".macro LDWD WD", result.text)
+        self.assertIn("#define DT(Q) .byt Q", result.text)
+        self.assertIn("#define LDWD(WD)", result.text)
 
     def test_comment_block_is_preserved_as_comments(self):
         src = "COMMENT *\nHELLO\nWORLD\n*\nLDAI 1\n"
@@ -78,14 +76,14 @@ class TranslateTests(unittest.TestCase):
     def test_exp_and_end_conversion(self):
         src = "EXP ^O15\nEND $Z+START\n"
         out = Translator().translate(src).text
-        self.assertIn(".byte ^O15", out)
-        self.assertIn(".end $Z+START", out)
+        self.assertIn(".byt 13", out)
+        self.assertIn("; END $Z+START", out)
 
     def test_trailing_endif_closer_on_data(self):
         src = "0>\n"
         out = Translator().translate(src).text
-        self.assertIn(".byte 0", out)
-        self.assertIn(".endif", out)
+        self.assertIn(".byt 0", out)
+        self.assertIn("#endif", out)
 
     def test_cli_strict_returns_nonzero_on_warnings(self):
         with tempfile.TemporaryDirectory() as tmp:
