@@ -166,6 +166,7 @@ class ExprEval:
         self.pc = pc
         self.radix = radix
         self.pass_num = pass_num
+        self.had_undef: bool = False  # set if eval saw any undefined symbol
 
     def eval(self, text: str) -> int:
         """Evaluate expression string; raises AsmError on error."""
@@ -264,6 +265,7 @@ class ExprEval:
             if key in self.symbols:
                 return self.symbols[key], end
             # undefined symbol: return 0 in pass 1, raise in pass 2
+            self.had_undef = True
             if self.pass_num == 1:
                 return 0, end
             raise AsmError(f"undefined symbol '{name}'")
@@ -309,15 +311,23 @@ def read_angle_block(text: str, pos: int) -> tuple:
 
 
 def skip_ws(text: str, pos: int) -> int:
-    """Skip spaces and tabs."""
-    while pos < len(text) and text[pos] in ' \t':
+    """Skip spaces, tabs and form-feeds."""
+    while pos < len(text) and text[pos] in ' \t\f':
         pos += 1
     return pos
 
 
 def skip_ws_nl(text: str, pos: int) -> int:
-    """Skip whitespace including newlines."""
-    while pos < len(text) and text[pos] in ' \t\r\n':
+    """Skip whitespace including newlines and form-feeds.
+
+    Form-feed (``\\f``, 0x0C) is treated as whitespace because real DEC
+    sources use it as a page-break marker (see m6502.asm just before
+    SUBTTL lines).  Without this the form-feed would otherwise be parsed
+    as the start of a bare expression and silently emit a 0 byte in pass 1
+    only — producing a one-byte drift between passes and corrupting all
+    forward symbol values from that line onward.
+    """
+    while pos < len(text) and text[pos] in ' \t\r\n\f':
         pos += 1
     return pos
 
@@ -410,6 +420,23 @@ class Emitter:
         self._cur_addr = addr
         self._cur_buf = bytearray()
 
+    def reserve(self, n: int):
+        """Reserve ``n`` bytes (e.g. for BLOCK).  Closes the current
+        segment so the binary emitter doesn't actually store the zeros,
+        and starts the next emit at ``current_addr + n``.  No entries are
+        added to ``self.listing`` (so the assembly listing won't show a
+        long run of ``00`` bytes for large BLOCK directives).  The to_binary
+        helper still zero-fills the gap when producing a flat binary, so
+        output is identical to emitting zero bytes."""
+        if n <= 0:
+            return
+        cur_end = (self._cur_addr or 0) + (len(self._cur_buf or b''))
+        # close current segment
+        if self._cur_buf is not None and len(self._cur_buf) > 0:
+            self.segments.append((self._cur_addr, bytes(self._cur_buf)))
+        self._cur_addr = cur_end + n
+        self._cur_buf = bytearray()
+
     def emit(self, byte: int):
         if self._cur_buf is None:
             self._cur_addr = 0
@@ -471,11 +498,20 @@ class Assembler:
         self.radix: int = 10
         self.emitter: Emitter = Emitter()
         self._local_ctr: int = 0   # counter for unique local labels
-        self._lineno: int = 0      # approximate source line number
+        self._cur_lineno: int = 1  # current source line number (top-level)
+        self._nesting: int = 0     # > 0 while inside macro/IF/REPEAT body
+        self._record_nested: bool = False  # True while inside an IF body
+                                           # whose lines should be listed
+                                           # individually (saved/restored on
+                                           # each nested _process_block call)
+        self._last_eval_undef: bool = False  # last _eval saw undefined sym
         self._if_stack: list = []  # for nested IFE/IFN (not used, we recurse)
         self._origin_set: bool = False
-        # records of emitted bytes per source line (pass 2)
-        self.listing_records: list = []  # tuples (start_addr, [bytes], source_text)
+        # listing rows (pass 2 only):
+        # list of (lineno, addr_or_None, [bytes], source_text)
+        self.listing_lines: list = []
+        # legacy alias kept for callers/tests
+        self.listing_records: list = []
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -498,13 +534,18 @@ class Assembler:
         self.pass_num = 1
         self.pc = 0
         self._origin_set = False
-        self._process_block(source, {})
+        self._cur_lineno = 1
+        self._nesting = 0
+        self._process_block(source, {}, nested=False)
         # Pass 2 — emit code
         self.pass_num = 2
         self.pc = 0
         self._origin_set = False
         self.emitter = Emitter()
-        self._process_block(source, {})
+        self.listing_lines = []
+        self._cur_lineno = 1
+        self._nesting = 0
+        self._process_block(source, {}, nested=False)
         self.emitter.flush()
         return self.emitter
 
@@ -539,20 +580,77 @@ class Assembler:
 
     # ── block processor ───────────────────────────────────────────────────────
 
-    def _process_block(self, text: str, local_params: dict):
-        """Process a block of source (possibly expanded macro body)."""
-        pos = 0
-        while pos < len(text):
-            pos = skip_ws_nl(text, pos)
-            if pos >= len(text):
-                break
-            pos = self._process_line(text, pos, local_params)
+    def _process_block(self, text: str, local_params: dict,
+                       nested: bool = True, expand_listing: bool = False):
+        """Process a block of source.
+
+        ``nested`` is False only for the outermost top-level pass over the
+        original source.
+
+        ``expand_listing`` requests that body lines be recorded individually
+        in the listing — used for ``IF*`` bodies which are verbatim slices
+        of the original source.  It is silently disabled if the parent
+        context isn't itself recording (so an ``IF`` inside a macro / REPEAT
+        / IRP / IRPC body doesn't break the parent's "macro suppression"
+        rule, matching the behaviour of the ``SALL`` listing directive).
+
+        Line-number tracking and the ``_record_nested`` flag are saved on
+        entry and restored on exit so that the outer ``_process_block``
+        loop can re-count line advances over the whole consumed slice and
+        thus stay in sync with the original source line numbering.
+        """
+        saved_record = self._record_nested
+        saved_lineno = self._cur_lineno
+        if nested:
+            parent_recorded = (self._nesting == 0) or saved_record
+            self._nesting += 1
+            # An IF body only "expands" in the listing if the parent
+            # context was already recording (top-level or another
+            # expanding-IF body).  This makes macro/REPEAT bodies
+            # suppress nested IF expansion, matching SALL semantics.
+            self._record_nested = bool(expand_listing and parent_recorded)
+        # Track line numbers when this block is part of the original source
+        # (top-level or an expanding IF body).
+        track_lineno = (not nested) or self._record_nested
+        try:
+            pos = 0
+            while pos < len(text):
+                new_pos = skip_ws_nl(text, pos)
+                if track_lineno:
+                    self._cur_lineno += text[pos:new_pos].count('\n')
+                pos = new_pos
+                if pos >= len(text):
+                    break
+                new_pos = self._process_line(text, pos, local_params)
+                if track_lineno:
+                    self._cur_lineno += text[pos:new_pos].count('\n')
+                pos = new_pos
+        finally:
+            if nested:
+                self._nesting -= 1
+                self._record_nested = saved_record
+                # Restore _cur_lineno so the outer loop's own newline
+                # count over the whole nested slice advances correctly
+                # without double-counting body newlines.
+                self._cur_lineno = saved_lineno
 
     def _extract_body(self, body_str: str) -> str:
-        """Extract the assembly body from a possibly angle-bracketed string."""
+        """Extract the assembly body from a possibly angle-bracketed string.
+
+        Accepts MACRO-10's optional notations:
+
+          IFx EXPR,<body>    ← standard
+          IFx EXPR<body>     ← optional comma omitted before angle block
+          IF1,<body>         ← bodyless directives may use leading comma
+          IF1 <body>         ← or just whitespace
+        """
         body_str = body_str.strip()
         if not body_str:
             return ''
+        # Allow a leading comma (e.g.  IF1,<body>  or  IFE expr,<body>'s body
+        # half once already split off)
+        if body_str.startswith(','):
+            body_str = body_str[1:].lstrip()
         if body_str.startswith('<'):
             inner, _ = read_angle_block(body_str, 0)
             return inner
@@ -630,35 +728,59 @@ class Assembler:
         uname = name.upper()
 
         if uname in ('TITLE','SUBTTL','PAGE','SALL','RADIX','SEARCH',
-                     'PRINTX','IF1','IF2','XLIST','LIST','NLIST',
-                     'SIXBIT','HRRZ','JRST','MOVEI','PJRST','PUTRST','CALL',
-                     'XWD_SKIP'):
-            # No-op directives (or PDP-10 instructions we skip)
+                     'PRINTX','XLIST','LIST','NLIST', 'END',
+                     'PURGE','EXTERN','EXTERNAL','ENTRY','INTERN','INTERNAL',
+                     'SIXBIT','HRRZ','HRLI','JRST','MOVEI','PJRST','PUTRST',
+                     'CALL','TJSR','XWD_SKIP',
+                     # MACRO-10 cross-reference control pseudo-ops (all dot-
+                     # prefixed forms): no effect on code generation.
+                     '.CREF', '.NCREF', '.XCREF', '.LIST', '.NLIST',
+                     '.XLIST', '.LALL', '.SALL', '.XALL',
+                     # Other rarely-used MACRO-10 listing controls
+                     'LALL', 'XALL'):
+            # No-op directives (or PDP-10 instructions we ignore for 6502).
+            # NB: numeric arg of RADIX is *always* decimal in MACRO-10 (the
+            # manual is explicit on this), regardless of the current radix.
             if uname == 'RADIX':
                 try:
-                    self.radix = int(raw.strip())
+                    self.radix = int(raw.strip(), 10)
                 except Exception:
                     pass
             if uname == 'PRINTX' and self.pass_num == 1:
                 print(f"  [PRINTX] {raw.strip()}")
+            if uname == 'PURGE':
+                # Remove listed symbols from the table (rare; conservative).
+                for nm in split_args(raw):
+                    k = normalize_symbol(nm.strip())
+                    if k and k not in self.predefined:
+                        self.symbols.pop(k, None)
+                        self.symbol_names.pop(k, None)
             return
 
         if uname in ('IFDEF', 'IFNDEF'):
-            # IFDEF sym,<body>  or  IFNDEF sym,<body>
+            # IFDEF sym,<body>  (or  IFDEF sym<body>  — comma optional when
+            # body is angle-bracketed, per MACRO-10 manual).
             raw = raw.strip()
-            # split at first comma not in angle
             depth = 0
             split_at = -1
+            body_at = -1
             for i, c in enumerate(raw):
+                if c == '<' and depth == 0:
+                    body_at = i
+                    break
                 if c == '<': depth += 1
                 elif c == '>': depth -= 1
                 elif c == ',' and depth == 0:
                     split_at = i
                     break
-            if split_at == -1:
+            if split_at != -1:
+                sym_str  = raw[:split_at].strip()
+                body_str = raw[split_at + 1:].strip()
+            elif body_at != -1:
+                sym_str  = raw[:body_at].strip()
+                body_str = raw[body_at:].strip()
+            else:
                 return
-            sym_str = raw[:split_at].strip()
-            body_str = raw[split_at + 1:].strip()
             # sym may be angle-bracketed or plain ident
             if sym_str.startswith('<') and sym_str.endswith('>'):
                 sym_name = sym_str[1:-1].strip()
@@ -669,7 +791,7 @@ class Assembler:
             take = (defined if uname == 'IFDEF' else not defined)
             if take:
                 body = self._extract_body(body_str)
-                self._process_block(body, local_params)
+                self._process_block(body, local_params, expand_listing=True)
             return
 
         if uname == 'XWD':
@@ -688,22 +810,35 @@ class Assembler:
             return
 
         if uname == 'BLOCK':
+            # BLOCK n  — reserve n bytes (manual: "all n words initialised
+            # to 0").  Implemented as a true reservation so the listing
+            # doesn't show a long run of "00" bytes for large BLOCKs.  The
+            # binary output still contains the implicit zeros via segment
+            # zero-fill.
             n = self._eval(raw, local_params)
             if n < 0:
                 n = 0
             if self.pass_num == 2:
-                for _ in range(n):
-                    self.emitter.emit(0)
+                self.emitter.reserve(n)
             self.pc += n
+            # Mark that any existing origin is now "moved" so a subsequent
+            # _emit() will start a fresh segment at the new pc.
+            self._origin_set = False
             return
 
         if uname == 'EXP':
-            # EXP can be called with or without parens: EXP val  or  EXP(val)
+            # EXP val[,val…]   — emit one byte per expression.
+            #   EXP 144,128,0,0   → four bytes
+            #   EXP(val)          → one byte (parenthesised single expr)
             arg = raw.strip()
             if arg.startswith('(') and arg.endswith(')'):
                 arg = arg[1:-1]
-            val = self._eval(arg, local_params)
-            self._emit(val & 0xFF)
+            for piece in split_args(arg):
+                piece = piece.strip()
+                if not piece:
+                    continue
+                val = self._eval(piece, local_params)
+                self._emit(val & 0xFF)
             return
 
         if uname == 'ADR':
@@ -762,13 +897,13 @@ class Assembler:
             # IF1,<body> — execute only in pass 1
             body = self._extract_body(raw)
             if body and self.pass_num == 1:
-                self._process_block(body, local_params)
+                self._process_block(body, local_params, expand_listing=True)
             return
 
         if uname == 'IF2':
             body = self._extract_body(raw)
             if body and self.pass_num == 2:
-                self._process_block(body, local_params)
+                self._process_block(body, local_params, expand_listing=True)
             return
 
         if uname == 'REPEAT':
@@ -794,6 +929,7 @@ class Assembler:
             return
 
         # ── Bare expression (emit byte) ───────────────────────────────────────
+        # ── Bare expression (emit byte) ─────────────────────────────────────
         # Reconstruct the "bare expression" from name + raw
         full_expr = name + (' ' + raw if raw else '')
         # Check for  SYM = EXPR  or  SYM == EXPR  forms
@@ -805,13 +941,26 @@ class Assembler:
             self.symbols[normalize_symbol(sym)] = val
             return
 
-        # Emit as raw byte
+        # Bare expression following an unrecognised mnemonic.  Both
+        # passes must always emit exactly one byte so PC stays
+        # synchronised; an undefined symbol contributes 0 and produces a
+        # pass-2 warning.  Real MACRO-10 listing pseudo-ops we don't
+        # model (e.g. .CREF, .XCREF, .LIST, …) are intercepted as
+        # no-ops earlier in this routine, so they never reach here.
+        stripped = full_expr.strip()
         try:
-            val = self._eval(full_expr.strip(), local_params)
-            self._emit(val & 0xFF)
+            val = self._eval(stripped, local_params)
         except AsmError:
-            if self.verbose:
-                print(f"  [skip] unknown statement: {name!r} {raw!r}")
+            val = 0
+            if self.pass_num == 2 and self.verbose:
+                print(f"  [warn] undefined in expression {stripped!r}; "
+                      f"emitting 0")
+        if self.pass_num == 2 and self._last_eval_undef and self.verbose:
+            # purely defined-elsewhere check: warn once in pass 2 if any
+            # part of the expression referenced an undefined symbol.
+            print(f"  [warn] expression {stripped!r} references "
+                  f"undefined symbol")
+        self._emit(val & 0xFF)
 
     # ── Label definition ───────────────────────────────────────────────────────
 
@@ -887,11 +1036,14 @@ class Assembler:
         expr = self._subst_params(expr.strip(), local_params)
         e = ExprEval(self.symbols, self.pc, self.radix, self.pass_num)
         try:
-            return e.eval(expr)
+            val = e.eval(expr)
         except AsmError:
+            self._last_eval_undef = True
             if self.pass_num == 1:
                 return 0   # undefined symbols / div-by-zero OK in pass 1
             raise
+        self._last_eval_undef = e.had_undef
+        return val
 
     def _subst_params(self, text: str, params: dict) -> str:
         """Substitute macro formal parameters in text (longest match first)."""
@@ -1000,12 +1152,20 @@ class Assembler:
     # ── Conditional assembly ──────────────────────────────────────────────────
 
     def _handle_conditional(self, kind: str, raw: str, local_params: dict):
-        """IFE/IFN/IFG/IFL/IFGE/IFLE expr,<body>"""
+        """IFE/IFN/IFG/IFL/IFGE/IFLE expr,<body>
+
+        MACRO-10 also permits omitting the comma when ``<body>`` is
+        angle-bracketed, e.g. ``IFE EXPR<body>``.
+        """
         raw = raw.strip()
-        # Find the comma that separates expr from body (depth-aware)
+        # Find the first top-level comma OR opening angle that ends EXPR.
         depth = 0
         split_at = -1
+        body_at = -1
         for i, c in enumerate(raw):
+            if c == '<' and depth == 0:
+                body_at = i
+                break
             if c == '<':
                 depth += 1
             elif c == '>':
@@ -1013,21 +1173,29 @@ class Assembler:
             elif c == ',' and depth == 0:
                 split_at = i
                 break
-        if split_at == -1:
+        if split_at != -1:
+            expr_str = raw[:split_at].strip()
+            body_str = raw[split_at + 1:].strip()
+        elif body_at != -1:
+            expr_str = raw[:body_at].strip()
+            body_str = raw[body_at:].strip()
+        else:
             return
-        expr_str = raw[:split_at].strip()
-        body_str = raw[split_at + 1:].strip()
+        # Comparisons in MACRO-10 are SIGNED.  Our evaluator returns a
+        # 16-bit unsigned value; sign-extend the high bit so negative
+        # values compare correctly for IFG / IFL / IFGE / IFLE.
         val = self._eval(expr_str, local_params)
+        sval = val - 0x10000 if val & 0x8000 else val
         take = False
         if   kind == 'IFE':  take = (val == 0)
         elif kind == 'IFN':  take = (val != 0)
-        elif kind == 'IFG':  take = (val >  0)
-        elif kind == 'IFL':  take = (val <  0)
-        elif kind == 'IFGE': take = (val >= 0)
-        elif kind == 'IFLE': take = (val <= 0)
+        elif kind == 'IFG':  take = (sval >  0)
+        elif kind == 'IFL':  take = (sval <  0)
+        elif kind == 'IFGE': take = (sval >= 0)
+        elif kind == 'IFLE': take = (sval <= 0)
         if take:
             body = self._extract_body(body_str)
-            self._process_block(body, local_params)
+            self._process_block(body, local_params, expand_listing=True)
 
     def _handle_ifdif(self, raw: str, local_params: dict, equal: bool):
         """IFDIF <a>,<b>,<body>  — assemble body if a != b (or == for IFIDN)."""
@@ -1057,7 +1225,7 @@ class Assembler:
         b = self._subst_params(parts[1], local_params)
         take = (a != b) if not equal else (a == b)
         if take and len(parts) >= 3:
-            self._process_block(parts[2], local_params)
+            self._process_block(parts[2], local_params, expand_listing=True)
 
     def _handle_repeat(self, raw: str, local_params: dict):
         """REPEAT n,<body>"""
@@ -1331,12 +1499,69 @@ def _process_line_patched(self, text: str, pos: int,
       SYMBOL = EXPR
       SYMBOL == EXPR
       bare-expr  (emits a byte)
+
+    All listing-record bookkeeping is done here at one point, gated on
+    ``self._nesting == 0`` (or inside an expand_listing block) so that
+    nested macro / REPEAT bodies don't double-record bytes that the parent
+    statement already attributes.
     """
+    record = (self.pass_num == 2 and
+              (self._nesting == 0 or self._record_nested))
+
+    # Find start of physical source line for nicer listing src text
+    src_line_start = pos
+    while src_line_start > 0 and text[src_line_start - 1] != '\n':
+        src_line_start -= 1
+    rec_lineno = self._cur_lineno
+    rec_start_pc = self.pc
+    rec_before_listing = len(self.emitter.listing) if self.emitter else 0
+    rec_records_before = len(self.listing_lines)
+    rec_had_label = [False]   # closure-mutable
+
+    def _record(end_pos):
+        if not record:
+            return
+        # If nested processing recorded its own listing rows during dispatch,
+        # this statement is a "header" (e.g. IFE/IFN that took its body):
+        # don't double-count the body's bytes here, just record the directive
+        # source line itself.  Place it BEFORE the body rows.
+        nested_added = (len(self.listing_lines) > rec_records_before)
+        src = text[src_line_start:end_pos].rstrip('\n').rstrip('\r')
+        if nested_added:
+            # Parent IF directive: show only its first physical source line;
+            # the body lines are already recorded separately.
+            bytes_out = []
+            addr = None
+            nl = src.find('\n')
+            if nl >= 0:
+                src = src[:nl].rstrip('\r')
+        else:
+            bytes_out = [b for _, b in
+                         self.emitter.listing[rec_before_listing:]]
+            # Show the address column when bytes were emitted, when the PC
+            # advanced silently (e.g. BLOCK reserves space without adding
+            # listing bytes), or when this is a label-only line (the label
+            # address is meaningful to the reader).
+            if bytes_out or self.pc != rec_start_pc or rec_had_label[0]:
+                addr = rec_start_pc
+            else:
+                addr = None
+        self.listing_lines.insert(rec_records_before,
+                                  (rec_lineno, addr, bytes_out, src))
+
+    pos0 = pos
     pos = skip_ws(text, pos)
-    if pos >= len(text) or text[pos] == '\n':
-        return pos + (1 if pos < len(text) else 0)
+    if pos >= len(text):
+        return pos
+    if text[pos] == '\n':
+        # blank line — record (so listing line numbers stay aligned) only if
+        # there was non-whitespace; otherwise drop it
+        return pos + 1
     if text[pos] == ';':
-        return self._skip_to_eol(text, pos)
+        # comment-only line — record with no bytes so the comment is shown
+        new_pos = self._skip_to_eol(text, pos)
+        _record(new_pos)
+        return new_pos
 
     start = pos  # save for bare-expr fallback
 
@@ -1347,18 +1572,24 @@ def _process_line_patched(self, text: str, pos: int,
     ident = text[id_start:pos]
 
     if not ident:
-        # Non-identifier start: bare char literal, number, etc. → emit byte
+        # Non-identifier start: bare char literal, number, etc. → emit byte.
+        # If the expression involves an undefined symbol, both passes emit
+        # 0 (rather than pass 1 emitting 0 and pass 2 silently skipping)
+        # so the PC stays synchronised across passes.
         raw_rest, pos = self._read_rest_of_line(text, start)
         raw_rest = raw_rest.strip()
         if raw_rest:
             try:
                 val = self._eval(raw_rest, local_params)
-                self._emit(val & 0xFF)
             except AsmError:
-                pass
+                val = 0
+                if self.pass_num == 2 and self.verbose:
+                    print(f"  [warn] undefined in expression "
+                          f"{raw_rest!r}; emitting 0")
+            self._emit(val & 0xFF)
+        _record(pos)
         return pos
 
-    after_ident = pos             # position right after the identifier
     pos = skip_ws(text, pos)     # skip optional whitespace
 
     # ── Symbol assignment:  IDENT = EXPR  or  IDENT == EXPR ──────────────────
@@ -1376,15 +1607,23 @@ def _process_line_patched(self, text: str, pos: int,
         if key in getattr(self, 'predefined', set()):
             if self.verbose:
                 print(f"Skipping source assignment of pre-defined symbol {sym}")
+            _record(pos)
             return pos
         self.symbols[key] = val
         self.symbol_names.setdefault(key, set()).add(sym)
+        # Record with the assigned value as "address" column (per DEC listing
+        # convention for equates: the value is shown in the addr field).
+        if record:
+            src = text[src_line_start:pos].rstrip('\n').rstrip('\r')
+            # "value" column — show the equate value
+            self.listing_lines.append((rec_lineno, val, [], src))
         return pos
 
     # ── Label definition:  IDENT:  or  IDENT:: ───────────────────────────────
     label = None
     if pos < len(text) and text[pos] == ':':
         label = self._subst_params(ident.upper(), local_params)
+        rec_had_label[0] = True
         if self.pass_num == 1:
             key = normalize_symbol(label)
             self.symbols[key] = self.pc
@@ -1395,48 +1634,31 @@ def _process_line_patched(self, text: str, pos: int,
         pos = skip_ws(text, pos)
         # Label-only line?
         if pos >= len(text) or text[pos] in (';\n'):
-            return self._skip_to_eol(text, pos)
+            new_pos = self._skip_to_eol(text, pos)
+            _record(new_pos)
+            return new_pos
         # Now read the mnemonic that follows the label
         name_start = pos
         while pos < len(text) and (text[pos].isalnum() or text[pos] in '._$%#@'):
             pos += 1
         name = text[name_start:pos].upper()
         if not name:
-            return self._skip_to_eol(text, pos)
+            new_pos = self._skip_to_eol(text, pos)
+            _record(new_pos)
+            return new_pos
         pos = skip_ws(text, pos)
+        # Symbol assignment after label?  "LBL: SYM = EXPR" is not common but
+        # handle "LBL=expr" via the earlier branch.
         raw_rest, pos = self._read_rest_of_line(text, pos)
-        # If pass 2, capture emitted bytes for this source line
-        if self.pass_num == 2:
-            before = len(self.emitter.listing)
-            start_addr = self.pc
-            self._dispatch(name, raw_rest.strip(), label, local_params)
-            after = len(self.emitter.listing)
-            if after > before:
-                new_entries = self.emitter.listing[before:after]
-                bytes_out = [b for _, b in new_entries]
-                src = (label + ': ' if label else '') + name + (' ' + raw_rest.strip() if raw_rest.strip() else '')
-                self.listing_records.append((start_addr, bytes_out, src))
-        else:
-            self._dispatch(name, raw_rest.strip(), label, local_params)
+        self._dispatch(name, raw_rest.strip(), label, local_params)
+        _record(pos)
         return pos
 
     # ── No label: the first ident IS the mnemonic/directive ──────────────────
     name = ident.upper()
-    # pos is already past optional whitespace after ident
     raw_rest, pos = self._read_rest_of_line(text, pos)
-    # capture listing for this source line in pass 2
-    if self.pass_num == 2:
-        before = len(self.emitter.listing)
-        start_addr = self.pc
-        self._dispatch(name, raw_rest.strip(), None, local_params)
-        after = len(self.emitter.listing)
-        if after > before:
-            new_entries = self.emitter.listing[before:after]
-            bytes_out = [b for _, b in new_entries]
-            src = name + (' ' + raw_rest.strip() if raw_rest.strip() else '')
-            self.listing_records.append((start_addr, bytes_out, src))
-    else:
-        self._dispatch(name, raw_rest.strip(), None, local_params)
+    self._dispatch(name, raw_rest.strip(), None, local_params)
+    _record(pos)
     return pos
 
 
@@ -1463,40 +1685,114 @@ def write_output(emitter: Emitter, path: str, fmt: str):
               f"${lo:04X}–${hi - 1:04X})")
 
 
-def print_listing(emitter: Emitter, asm):
-    """Print a readable assembly listing using assembler's recorded records.
+def print_listing(emitter: Emitter, asm, file=None):
+    """Print a hex DEC-MACRO style assembly listing.
 
-    Expects `asm` to be the Assembler instance which holds `listing_records`
-    and `symbol_names` mapping for full symbol names.
+    Adapted to the 6502: 16-bit hex address column (instead of MACRO-10's
+    18-bit octal), 8-bit hex byte column (instead of 36-bit words).
+
+        LLLLL  AAAA  BB BB BB BB    SOURCE-LINE
+        LLLLL  VVVV                 SYM == VALUE          (equate)
+        LLLLL                       SOURCE-LINE           (no-emit directive)
+
+    If a single source statement emitted more than 4 bytes, continuation
+    listing lines show successive (addr, bytes) groups.  If the statement
+    spans multiple physical source lines (e.g. an IF<…multi-line body…>),
+    each physical source line is printed on its own listing line, aligned
+    with any matching continuation bytes column.
     """
-    print("\nAssembly listing:\n")
-    # build addr -> list of full symbol names
-    sym_by_addr = {}
-    try:
-        for key, val in asm.symbols.items():
-            names = asm.symbol_names.get(key, {key})
-            for n in names:
-                sym_by_addr.setdefault(val, []).append(n)
-    except Exception:
-        pass
+    if file is None:
+        file = sys.stdout
 
-    if getattr(asm, 'listing_records', None):
-        for start_addr, bytes_out, src in asm.listing_records:
-            labels = sym_by_addr.get(start_addr, [])
-            lbl = (': '.join(labels) + ':') if labels else ''
-            bytes_hex = ' '.join(f"{b:02X}" for b in bytes_out)
-            print(f"{start_addr:04X}: {bytes_hex:20s} {lbl} {src}")
-        return
+    BYTES_PER_LINE = 4
+    LN_W   = 5      # line-number column
+    ADDR_W = 4      # 16-bit hex address
+    # 4 bytes × ("BB" + space) -1 = 11 cols
+    BYTES_W = BYTES_PER_LINE * 3 - 1
 
-    # Fallback: per-address dump
-    by_addr = {}
-    for addr, byte in emitter.listing:
-        by_addr.setdefault(addr, []).append(byte)
-    for addr in sorted(by_addr.keys()):
-        labels = sym_by_addr.get(addr, [])
-        lbl = ' '.join(labels) if labels else ''
-        bytes_hex = ' '.join(f"{b:02X}" for b in by_addr[addr])
-        print(f"{addr:04X}: {bytes_hex:20s} {lbl}")
+    def _row(lineno, addr_field, byte_field, src_field=""):
+        ln = f"{lineno:>{LN_W}}" if lineno else " " * LN_W
+        af = (addr_field if addr_field else "").ljust(ADDR_W)
+        bf = (byte_field or "").ljust(BYTES_W)
+        return f"{ln}  {af}  {bf}  {src_field}".rstrip()
+
+    print(file=file)
+    print("Assembly listing:", file=file)
+    print(file=file)
+    print(f"{'LINE':>{LN_W}}  {'ADDR':<{ADDR_W}}  {'BYTES':<{BYTES_W}}  "
+          f"SOURCE", file=file)
+    print("-" * 78, file=file)
+
+    rows = getattr(asm, 'listing_lines', None) or []
+
+    for lineno, addr, bytes_out, src in rows:
+        # Split source into physical lines for display
+        src_lines = src.replace('\r', '').split('\n') if src else ['']
+        # Pre-compute byte chunks and their addresses
+        chunks = []
+        if bytes_out:
+            cur = addr & 0xFFFF
+            i = 0
+            while i < len(bytes_out):
+                chunk = bytes_out[i:i + BYTES_PER_LINE]
+                chunks.append((cur, chunk))
+                cur = (cur + len(chunk)) & 0xFFFF
+                i += BYTES_PER_LINE
+        else:
+            chunks = []
+
+        # Total lines is max(len(src_lines), len(chunks))
+        total = max(len(src_lines), len(chunks), 1)
+
+        for i in range(total):
+            ln  = lineno if i == 0 else 0
+            # Address column: equate value on first line if no bytes,
+            # otherwise the chunk's address.
+            if i < len(chunks):
+                af = f"{chunks[i][0]:04X}"
+                bf = ' '.join(f"{b:02X}" for b in chunks[i][1])
+            else:
+                if i == 0 and not bytes_out and addr is not None:
+                    af = f"{addr & 0xFFFF:04X}"  # equate value
+                else:
+                    af = ""
+                bf = ""
+            sf = src_lines[i] if i < len(src_lines) else ""
+            print(_row(ln, af, bf, sf), file=file)
+
+
+def print_symbol_table(asm, file=None):
+    """Print the symbol table in hex, sorted alphabetically.
+
+    Mimics the MACRO-10 cross-reference / symbol table at the end of a
+    listing, but uses 16-bit hex values instead of octal.
+    """
+    if file is None:
+        file = sys.stdout
+    print(file=file)
+    print("Symbol table:", file=file)
+    print(file=file)
+    # Build (display-name -> value) dict, preferring the longest original name
+    # captured for each normalized key.
+    items = []
+    for key, val in asm.symbols.items():
+        names = asm.symbol_names.get(key, {key})
+        # pick longest original name (most descriptive)
+        name = max(names, key=len)
+        items.append((name, val))
+    items.sort(key=lambda kv: kv[0])
+    # Print 3 per line for compactness
+    COLS = 3
+    COLW = 26
+    line = []
+    for i, (name, val) in enumerate(items):
+        cell = f"{name:<14s}= {val & 0xFFFF:04X}"
+        line.append(cell.ljust(COLW))
+        if (i + 1) % COLS == 0:
+            print('  '.join(line), file=file)
+            line = []
+    if line:
+        print('  '.join(line), file=file)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1512,7 +1808,11 @@ def main():
     parser.add_argument('-D', '--define', action='append', default=[],
                         metavar='SYM[=VAL]',
                         help='pre-define symbol; -D REALIO=4')
-    parser.add_argument('-v', '--verbose', action='store_true')
+    parser.add_argument('-l', '--listing',
+                        help='write hex listing to FILE (default: stdout '
+                             'when -v is given)')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='print listing and symbols on stdout')
     args = parser.parse_args()
 
     outpath = args.output or os.path.splitext(args.input)[0] + (
@@ -1528,7 +1828,7 @@ def main():
         else:
             asm.define(d.strip().upper(), 1)
 
-    print(f"Pass 1…")
+    print("Pass 1…")
     try:
         emitter = asm.assemble_file(args.input)
     except AsmError as e:
@@ -1542,12 +1842,14 @@ def main():
         sys.exit(1)
 
     print(f"Pass 2 complete. Symbols defined: {len(asm.symbols)}")
-    if args.verbose:
-        # Print a simple listing (addresses, bytes, labels)
+    if args.listing:
+        with open(args.listing, 'w') as f:
+            print_listing(emitter, asm, file=f)
+            print_symbol_table(asm, file=f)
+        print(f"Wrote listing: {args.listing}")
+    elif args.verbose:
         print_listing(emitter, asm)
-        print('\nSymbols:')
-        for k, v in sorted(asm.symbols.items()):
-            print(f"  {k:20s} = {v:#06x} ({v})")
+        print_symbol_table(asm)
 
     write_output(emitter, outpath, args.format)
 
