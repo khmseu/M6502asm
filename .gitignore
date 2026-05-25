@@ -2,3 +2,4 @@
 *.bin
 *.lst
 test*
+tools/rewrite_unpushed_commit_messages.py
