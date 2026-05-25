@@ -68,3 +68,5 @@ The translator currently handles:
 
 A small number of metaprogramming constructs may still require manual review in other source variants.
 Use `--strict` in CI or automated checks to detect such cases.
+
+When `--map-file` is used, the translator also emits a warning if multiple source symbols map to the same output symbol.

@@ -103,6 +103,13 @@ class TranslateTests(unittest.TestCase):
                 rc = main(["--in", str(src), "--dry-run", "--strict"])
             self.assertEqual(0, rc)
 
+    def test_symbol_map_collision_warns_once(self):
+        src = "ABCDEF==1\nABCDEFG==2\n"
+        translator = Translator(symbol_map={"ABCDEF": "SYM", "ABCDEFG": "SYM"})
+        result = translator.translate(src)
+        matches = [w for w in result.warnings if "Symbol mapping collision" in w]
+        self.assertEqual(1, len(matches))
+
 
 if __name__ == "__main__":
     unittest.main()

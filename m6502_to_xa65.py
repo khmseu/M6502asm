@@ -85,9 +85,24 @@ class Translator:
         self.symbol_map = symbol_map or {}
         self.preserve_includes = preserve_includes
         self.warnings: list[str] = []
+        self._mapped_symbol_owner: dict[str, str] = {}
+        self._emitted_collision_keys: set[tuple[str, str, str]] = set()
 
     def map_symbol(self, symbol: str) -> str:
-        return self.symbol_map.get(symbol, symbol)
+        mapped = self.symbol_map.get(symbol, symbol)
+        owner = self._mapped_symbol_owner.get(mapped)
+        if owner is None:
+            self._mapped_symbol_owner[mapped] = symbol
+            return mapped
+        if owner != symbol:
+            pair = tuple(sorted((owner, symbol)))
+            key = (mapped, pair[0], pair[1])
+            if key not in self._emitted_collision_keys:
+                self._emitted_collision_keys.add(key)
+                self.warnings.append(
+                    f"Symbol mapping collision: {pair[0]} and {pair[1]} both map to {mapped}"
+                )
+        return mapped
 
     def translate(self, source: str) -> TranslationResult:
         lines = source.splitlines()
