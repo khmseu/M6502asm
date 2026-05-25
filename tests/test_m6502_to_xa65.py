@@ -51,8 +51,9 @@ class TranslateTests(unittest.TestCase):
             "\tLDY\t<WD>+1>\n"
         )
         result = Translator().translate(src)
-        self.assertNotIn("Unbalanced DEFINE body", "\n".join(result.warnings))
+        self.assertEqual([], result.warnings)
         self.assertIn(".macro DT Q", result.text)
+        self.assertIn(".byte Q", result.text)
         self.assertIn(".macro LDWD WD", result.text)
 
     def test_comment_block_is_preserved_as_comments(self):

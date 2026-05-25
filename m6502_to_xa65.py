@@ -175,6 +175,11 @@ class Translator:
         params_raw = (header_match.group(2) or "").strip()
         params = [self.map_symbol(p.strip()) for p in params_raw.split(",") if p.strip()]
 
+        if name.upper() == "DT" and len(params) == 1:
+            # DT expands text arguments into bytes; in xa65 a direct .byte on the
+            # macro parameter preserves the intended call-site behavior.
+            return [f".macro {name} {params[0]}", f".byte {params[0]}", ".endmacro"], idx - start
+
         out = [f".macro {name}{(' ' + ', '.join(params)) if params else ''}"]
         for body_line in body.splitlines():
             translated = self._translate_line(body_line)
