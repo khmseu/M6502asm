@@ -35,10 +35,56 @@ class TranslateCa65Tests(unittest.TestCase):
         self.assertIn(".res 3", out)
         self.assertIn('.byte "OK"', out)
 
+    def test_single_char_double_quotes_become_char_literals(self):
+        src = 'LDAI " "\nDT "T"\n'
+        out = Translator().translate(src).text
+        self.assertIn("LDA #' '", out)
+        self.assertIn(".byte 'T'", out)
+
     def test_include_handling(self):
         src = "SEARCH M6502\n"
         out = Translator(preserve_includes=True).translate(src).text
         self.assertIn('.include "M6502"', out)
+
+    def test_symbolic_alias_redefinition_inserts_undef(self):
+        src = "FOO=BAR\nFOO=BAZ\n"
+        out = Translator().translate(src).text
+        self.assertIn(".define FOO BAR", out)
+        self.assertIn(".undef FOO", out)
+        self.assertIn(".define FOO BAZ", out)
+
+    def test_label_shadowing_macro_alias_inserts_undef(self):
+        src = "FOO=BAR\nFOO: NOP\n"
+        out = Translator().translate(src).text
+        self.assertNotIn(".define FOO BAR", out)
+        self.assertIn("FOO: NOP", out)
+
+    def test_repeat_block_maps_to_repeat_directives(self):
+        src = "IFE 1,<\nREPEAT 2,\nLDAI 0\n>\n"
+        out = Translator().translate(src).text
+        self.assertIn(".repeat 2", out)
+        self.assertIn(".endrepeat", out)
+
+    def test_trailing_operand_comma_is_removed(self):
+        src = "LDA TABLE,X,\n"
+        out = Translator().translate(src).text
+        self.assertIn("LDA TABLE,X", out)
+        self.assertNotIn("LDA TABLE,X,", out)
+
+    def test_non_6502_mnemonic_is_commented(self):
+        src = "HRRZ 14,.JBDDT##\n"
+        out = Translator().translate(src).text
+        self.assertIn("; HRRZ 14,.JBDDT##", out)
+
+    def test_unresolved_if_expression_falls_back_to_false(self):
+        src = "IF BUF,<LDAI 1>\n"
+        out = Translator().translate(src).text
+        self.assertIn(".if 0 ; unresolved .if expression for ca65:", out)
+
+    def test_parenthesized_immediate_uses_low_byte(self):
+        src = "CPX #(TEMPST+STRSIZ)*NUMTMP\n"
+        out = Translator().translate(src).text
+        self.assertIn("CPX #<((TEMPST+STRSIZ)*NUMTMP)", out)
 
     def test_cli_strict_returns_nonzero_on_warnings(self):
         with tempfile.TemporaryDirectory() as tmp:

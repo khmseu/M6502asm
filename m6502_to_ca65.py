@@ -8,7 +8,7 @@ import re
 import sys
 from pathlib import Path
 
-from m6502_to_xa65 import TranslationResult, Translator as XaTranslator, load_symbol_map
+from m6502_to_xa65 import _OPCODES, TranslationResult, Translator as XaTranslator, load_symbol_map
 
 _DEFINE_RE = re.compile(r"^#define\s+([^\s]+)\s+(.+)$")
 _NUMERIC_EXPR_RE = re.compile(r"^[0-9\s()+\-*/%&|^]+$")
@@ -16,10 +16,70 @@ _ORG_RE = re.compile(r"^(\s*)\*\s*=\s*(.+)$")
 _BYT_RE = re.compile(r"^(\s*(?:[A-Za-z_.$%#@][\w.$%#@]*:\s*)?)\.byt\b", re.IGNORECASE)
 _DSB_RE = re.compile(r"^(\s*(?:[A-Za-z_.$%#@][\w.$%#@]*:\s*)?)\.dsb\b", re.IGNORECASE)
 _ASC_RE = re.compile(r"^(\s*(?:[A-Za-z_.$%#@][\w.$%#@]*:\s*)?)\.asc\s+", re.IGNORECASE)
+_LABEL_RE = re.compile(r"^\s*([A-Za-z_.$%#@][\w.$%#@]*):")
+_CA65_DEFINE_RE = re.compile(r"^\s*\.define\s+([A-Za-z_.$%#@][\w.$%#@]*)")
+_CA65_SET_RE = re.compile(r"^\s*([A-Za-z_.$%#@][\w.$%#@]*)\s+\.set\b")
+_SINGLE_CHAR_DQ_RE = re.compile(r'"([^"\\])"')
+_REPEAT_START_RE = re.compile(r"^\s*REPEAT\s+(.+?)(?:,)?\s*$", re.IGNORECASE)
+_ENDIF_RE = re.compile(r"^\s*\.endif\s*$", re.IGNORECASE)
+_IF_RE = re.compile(r"^\s*\.if\s+(.+)$", re.IGNORECASE)
+_IDENT_RE = re.compile(r"\b[A-Za-z_.$%#@][\w.$%#@]*\b")
 
 
 def _rewrite_if_expr(expr: str) -> str:
     return expr.replace("!=", "<>").replace("==", "=")
+
+
+def _rewrite_single_char_dq(line: str) -> str:
+    def repl(m: re.Match[str]) -> str:
+        c = m.group(1)
+        return "39" if c == "'" else f"'{c}'"
+
+    return _SINGLE_CHAR_DQ_RE.sub(repl, line)
+
+
+def _strip_trailing_operand_comma(line: str) -> str:
+    code, sep, comment = line.partition(";")
+    code = re.sub(r",\s*$", "", code)
+    if not sep:
+        return code
+    return f"{code};{comment}"
+
+
+def _coerce_parenthesized_immediate_low_byte(line: str) -> str:
+    # ca65 enforces 8-bit immediates. The source frequently uses parenthesized
+    # expressions where the low byte is intended.
+    out = line.replace("#(", "#<(")
+    # If arithmetic continues after the closing paren, ensure the `<` applies
+    # to the whole expression, not just the first parenthesized term.
+    out = re.sub(r"#<\(([^)]+)\)\s*([+\-*/&|])\s*([^\s,;]+)", r"#<((\1)\2\3)", out)
+    return out
+
+
+def _comment_non_6502_mnemonics(line: str) -> str:
+    code, sep, comment = line.partition(";")
+    stripped = code.strip()
+    if not stripped:
+        return line
+
+    m_label = _LABEL_RE.match(stripped)
+    if m_label:
+        stripped = stripped[m_label.end() :].strip()
+        if not stripped:
+            return line
+
+    head = stripped.split(None, 1)[0]
+    if head.startswith("."):
+        return line
+
+    if head.upper() == "REPEAT":
+        return line
+
+    # Comment out clearly non-6502 mnemonics (e.g. HRRZ/JRST) that appear in
+    # target-specific branches and would otherwise break ca65 parsing.
+    if re.fullmatch(r"[A-Z][A-Z0-9]{2,}", head) and head.upper() not in _OPCODES:
+        return "; " + line
+    return line
 
 
 def _rewrite_line_for_ca65(line: str) -> str:
@@ -54,11 +114,77 @@ def _rewrite_line_for_ca65(line: str) -> str:
     line = _BYT_RE.sub(r"\1.byte", line)
     line = _DSB_RE.sub(r"\1.res", line)
     line = _ASC_RE.sub(r"\1.byte ", line)
+    line = _rewrite_single_char_dq(line)
+    line = _coerce_parenthesized_immediate_low_byte(line)
+    line = _strip_trailing_operand_comma(line)
+    line = _comment_non_6502_mnemonics(line)
     return line
 
 
 def _rewrite_text_for_ca65(text: str) -> str:
-    out_lines = [_rewrite_line_for_ca65(ln) for ln in text.splitlines()]
+    rewritten_lines = [_rewrite_line_for_ca65(src_line) for src_line in text.splitlines()]
+
+    label_names: set[str] = set()
+    for line in rewritten_lines:
+        label_match = _LABEL_RE.match(line)
+        if label_match:
+            label_names.add(label_match.group(1))
+
+    out_lines: list[str] = []
+    active_macro_aliases: set[str] = set()
+    known_constant_symbols: set[str] = set()
+    pending_repeat_closers = 0
+
+    for line in rewritten_lines:
+        repeat_match = _REPEAT_START_RE.match(line)
+        if repeat_match:
+            line = f".repeat {repeat_match.group(1).strip()}"
+            pending_repeat_closers += 1
+        elif pending_repeat_closers > 0 and _ENDIF_RE.match(line):
+            line = ".endrepeat"
+            pending_repeat_closers -= 1
+
+        set_match = _CA65_SET_RE.match(line)
+        if set_match and set_match.group(1) in label_names:
+            continue
+
+        define_match = _CA65_DEFINE_RE.match(line)
+        if define_match and define_match.group(1) in label_names:
+            continue
+
+        label_match = _LABEL_RE.match(line)
+        if label_match:
+            label = label_match.group(1)
+            if label in active_macro_aliases:
+                out_lines.append(f".undef {label}")
+                active_macro_aliases.remove(label)
+
+        if set_match:
+            name = set_match.group(1)
+            if name in active_macro_aliases:
+                out_lines.append(f".undef {name}")
+                active_macro_aliases.remove(name)
+            known_constant_symbols.add(name)
+
+        if define_match:
+            name = define_match.group(1)
+            if name in active_macro_aliases:
+                out_lines.append(f".undef {name}")
+            active_macro_aliases.add(name)
+
+        if_match = _IF_RE.match(line)
+        if if_match:
+            expr = if_match.group(1)
+            unresolved = [
+                tok
+                for tok in _IDENT_RE.findall(expr)
+                if tok not in known_constant_symbols and tok.lower() != "defined"
+            ]
+            if unresolved:
+                line = f".if 0 ; unresolved .if expression for ca65: {expr}"
+
+        out_lines.append(line)
+
     return "\n".join(out_lines) + "\n"
 
 
