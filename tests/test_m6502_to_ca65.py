@@ -56,8 +56,8 @@ class TranslateCa65Tests(unittest.TestCase):
     def test_label_shadowing_macro_alias_inserts_undef(self):
         src = "FOO=BAR\nFOO: NOP\n"
         out = Translator().translate(src).text
-        self.assertNotIn(".define FOO BAR", out)
-        self.assertIn("FOO: NOP", out)
+        self.assertIn(".define FOO BAR", out)
+        self.assertIn(".undef FOO\nFOO: NOP", out)
 
     def test_repeat_block_maps_to_repeat_directives(self):
         src = "IFE 1,<\nREPEAT 2,\nLDAI 0\n>\n"
@@ -85,6 +85,12 @@ class TranslateCa65Tests(unittest.TestCase):
         src = "CPX #(TEMPST+STRSIZ)*NUMTMP\n"
         out = Translator().translate(src).text
         self.assertIn("CPX #<((TEMPST+STRSIZ)*NUMTMP)", out)
+
+    def test_bufpag_emits_buf_alias(self):
+        src = "BUFPAG=2\n"
+        out = Translator().translate(src).text
+        self.assertIn("BUFPAG .set 2", out)
+        self.assertIn(".define BUF BUFPAG*256", out)
 
     def test_cli_strict_returns_nonzero_on_warnings(self):
         with tempfile.TemporaryDirectory() as tmp:

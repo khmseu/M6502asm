@@ -149,8 +149,6 @@ def _rewrite_text_for_ca65(text: str) -> str:
             continue
 
         define_match = _CA65_DEFINE_RE.match(line)
-        if define_match and define_match.group(1) in label_names:
-            continue
 
         label_match = _LABEL_RE.match(line)
         if label_match:
@@ -165,6 +163,12 @@ def _rewrite_text_for_ca65(text: str) -> str:
                 out_lines.append(f".undef {name}")
                 active_macro_aliases.remove(name)
             known_constant_symbols.add(name)
+            if name == "BUFPAG":
+                if "BUF" in active_macro_aliases:
+                    out_lines.append(".undef BUF")
+                    active_macro_aliases.remove("BUF")
+                out_lines.append(".define BUF BUFPAG*256")
+                active_macro_aliases.add("BUF")
 
         if define_match:
             name = define_match.group(1)
