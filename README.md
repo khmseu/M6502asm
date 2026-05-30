@@ -61,6 +61,19 @@ Run translator tests:
 python3 -m unittest discover -s tests -v
 ```
 
+Run full ca65 translation + assembly flow:
+
+```bash
+./tools/translate_and_assemble_ca65.sh
+```
+
+Equivalent one-shot command:
+
+```bash
+python3 m6502_to_ca65.py --in BASIC-M6502/m6502.asm --out examples/converted/m6502_ca65.asm && \
+ca65 -o examples/converted/m6502_ca65.o --listing examples/converted/m6502_ca65.lst examples/converted/m6502_ca65.asm
+```
+
 ## Current Coverage
 
 The translator currently handles:
