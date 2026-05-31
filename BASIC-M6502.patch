@@ -1,8 +1,13 @@
 diff --git a/m6502.asm b/m6502.asm
-index 51c07c9..cf5848f 100644
+index 51c07c9..ac92dc1 100644
 --- a/m6502.asm
 +++ b/m6502.asm
-@@ -90,21 +90,22 @@ IFE	REALIO-4,<
+@@ -87,20 +87,22 @@ IFN	ROMSW,<
+ 	RAMLOC==^O100000>
+ 	OUTCH==^O177013>
+ IFE	REALIO-4,<
++	LNGERR==1
++	DISKO==1
  	RORSW==1
  	NULCMD==0
  	GETCMD==1
@@ -29,9 +34,3 @@ index 51c07c9..cf5848f 100644
  	LINLEN==40
  	BUFLEN==240
  	RORSW==1
--	STKEND=507>
-+	STKEND=507
-+	LNGERR==1>
- IFE	RORSW,<
- DEFINE	ROR (WD),<
- 	LDAI	0
